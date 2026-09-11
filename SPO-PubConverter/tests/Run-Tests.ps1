@@ -349,6 +349,167 @@ try {
     Assert-PubTest ($result.Action -eq 'Convert' -and -not (Test-Path -LiteralPath $targetPdf)) 'existing PDF + Overwrite replaces it'
 
     # -----------------------------------------------------------------------
+    Write-PubTestSection 'Console menu (brief section 7)'
+    # -----------------------------------------------------------------------
+    # Load the menu's functions without going interactive.
+    . (Join-Path $projectRoot 'Start-Menu.ps1') -NoRun
+
+    function Get-RenderedMenu {
+        param($MenuConfig, $MenuInventory = @(), $MenuSelection = @(), [string] $MenuPath = '')
+
+        $script:Config        = $MenuConfig
+        $script:Inventory     = $MenuInventory
+        $script:Selection     = $MenuSelection
+        $script:InventoryPath = $MenuPath
+        $script:VerifiedRoute = ''
+
+        # Write-Host -NoNewline segments arrive as separate records when
+        # captured, so rejoin them before matching on content.
+        $rendered = Show-PubMainMenu -NoClear 6>&1 | Out-String
+        return ($rendered -replace '(NEXT|NOTE):\s*[\r\n]+\s*', '$1: ')
+    }
+
+    $freshConfig = New-PubDefaultConfig
+    $freshMenu   = Get-RenderedMenu -MenuConfig $freshConfig
+
+    # The labels the brief specifies, verbatim, in the order it gives them.
+    $briefLabels = [ordered] @{
+        '1'  = 'Generate or connect Azure AD App Registration'
+        '2'  = 'Generate & upload authentication certificate'
+        '3'  = 'Test connection to Microsoft Graph / SharePoint'
+        '4'  = 'Scan tenant for Publisher (.pub) files'
+        '5'  = 'Export / re-export scan results to CSV'
+        '6'  = 'Load a CSV and select files to process'
+        '7'  = 'Download selected files'
+        '8'  = 'Convert downloaded files to PDF'
+        '9'  = 'Upload converted PDFs to original SharePoint location'
+        '10' = 'Run full pipeline (4 -> 9) unattended'
+        '11' = 'View recent log'
+        '12' = 'Open working folder'
+        '0'  = 'Exit'
+    }
+
+    foreach ($number in $briefLabels.Keys) {
+        Assert-PubTest ($freshMenu -match [regex]::Escape(('{0}) {1}' -f $number, $briefLabels[$number]))) ('option {0} keeps the label from the brief' -f $number)
+    }
+
+    $labelOrder = @()
+    foreach ($line in ($freshMenu -split "`r?`n")) {
+        if ($line -match '^\s+(\d+)\)\s') { $labelOrder += $Matches[1] }
+    }
+    Assert-PubTest (($labelOrder -join ',') -eq '1,2,3,4,5,6,7,8,9,10,11,12,13,0') 'options run in setup -> discovery -> convert -> publish -> utilities order, with 0 last'
+
+    foreach ($heading in @('SETUP', 'DISCOVERY', 'CONVERSION', 'PUBLISH', 'UTILITIES')) {
+        Assert-PubTest ($freshMenu -match $heading) ('the {0} group is labelled' -f $heading)
+    }
+
+    # Nothing configured: point at option 1 and say so plainly.
+    Assert-PubTest ($freshMenu -match 'NEXT: option 1') 'a brand new install points at option 1'
+    Assert-PubTest ($freshMenu -match 'not set up yet') 'an unconfigured tenant says so rather than showing a blank'
+    Assert-PubTest ($freshMenu -match 'needs setup')    'steps that cannot work yet say why'
+
+    # Set up, with work outstanding at each stage in turn.
+    $readyConfig = New-PubDefaultConfig
+    $readyConfig['TenantDomain']          = 'contoso.onmicrosoft.com'
+    $readyConfig['AppId']                 = '11111111-1111-1111-1111-111111111111'
+    $readyConfig['CertificateThumbprint'] = 'ABC123'
+    $readyConfig['CertificateExpiry']     = (Get-Date).AddYears(2).ToString('yyyy-MM-dd')
+
+    $menuNoCert = Get-RenderedMenu -MenuConfig (@{} + $readyConfig + @{ CertificateThumbprint = '' })
+    Assert-PubTest ($menuNoCert -match 'NEXT: option 2') 'an app with no certificate points at option 2'
+
+    $expiredConfig = @{} + $readyConfig
+    $expiredConfig['CertificateExpiry'] = (Get-Date).AddDays(-2).ToString('yyyy-MM-dd')
+    $menuExpired = Get-RenderedMenu -MenuConfig $expiredConfig
+    Assert-PubTest ($menuExpired -match 'NEXT: option 2')     'an expired certificate takes priority over everything else'
+    Assert-PubTest ($menuExpired -match 'CERTIFICATE EXPIRED') 'an expired certificate is called out in the header'
+    Assert-PubTest ($menuExpired -match 'EXPIRED')             'option 2 is flagged as expired in the list'
+
+    $menuNoScan = Get-RenderedMenu -MenuConfig $readyConfig
+    Assert-PubTest ($menuNoScan -match 'NEXT: option 4') 'a set-up tenant with no inventory points at the scan'
+
+    $pendingRows = @(
+        New-PubInventoryRow -Values @{ FileName = 'a.pub'; Status = 'Pending';    DriveId = 'd'; ItemId = '1' }
+        New-PubInventoryRow -Values @{ FileName = 'b.pub'; Status = 'Downloaded'; DriveId = 'd'; ItemId = '2' }
+        New-PubInventoryRow -Values @{ FileName = 'c.pub'; Status = 'Converted';  DriveId = 'd'; ItemId = '3' }
+    )
+    $menuPending = Get-RenderedMenu -MenuConfig $readyConfig -MenuInventory $pendingRows -MenuPath 'C:\inv.csv'
+    Assert-PubTest ($menuPending -match 'NEXT: option 7')   'rows waiting to download point at option 7'
+    Assert-PubTest ($menuPending -match '1 to download')    'the header counts what is waiting'
+    Assert-PubTest ($menuPending -match 'inv\.csv')         'the loaded file list is named'
+
+    $downloadedRows = @($pendingRows | Where-Object { $_.Status -ne 'Pending' })
+    $menuDownloaded = Get-RenderedMenu -MenuConfig $readyConfig -MenuInventory $downloadedRows -MenuPath 'C:\inv.csv'
+    Assert-PubTest ($menuDownloaded -match 'NEXT: option 8') 'downloaded rows point at the conversion step'
+
+    $convertedRows = @($pendingRows | Where-Object { $_.Status -eq 'Converted' })
+    $menuConverted = Get-RenderedMenu -MenuConfig $readyConfig -MenuInventory $convertedRows -MenuPath 'C:\inv.csv'
+    Assert-PubTest ($menuConverted -match 'NEXT: option 9') 'converted rows point at the upload step'
+
+    $uploadedRows = @(New-PubInventoryRow -Values @{ FileName = 'd.pub'; Status = 'Uploaded'; DriveId = 'd'; ItemId = '4' })
+    $menuDone = Get-RenderedMenu -MenuConfig $readyConfig -MenuInventory $uploadedRows -MenuPath 'C:\inv.csv'
+    Assert-PubTest ($menuDone -match 'nothing outstanding') 'a finished inventory says there is nothing left to do'
+
+    $failedRows = @(New-PubInventoryRow -Values @{ FileName = 'e.pub'; Status = 'Failed'; DriveId = 'd'; ItemId = '5' })
+    $menuFailed = Get-RenderedMenu -MenuConfig $readyConfig -MenuInventory $failedRows -MenuPath 'C:\inv.csv'
+    Assert-PubTest ($menuFailed -match 'failed') 'failures are surfaced in the header'
+    Assert-PubTest ($menuFailed -match 'NEXT: option 6') 'failures point at re-selecting them to retry'
+
+    $selectionMenu = Get-RenderedMenu -MenuConfig $readyConfig -MenuInventory $pendingRows -MenuSelection @($pendingRows[0]) -MenuPath 'C:\inv.csv'
+    Assert-PubTest ($selectionMenu -match 'Working on') 'a narrowed selection is stated in the header'
+    Assert-PubTest ($selectionMenu -match '1 of 3')     'the header says how much of the inventory is selected'
+
+    $armedConfig = @{} + $readyConfig
+    $armedConfig['RemoveSourceAfterUpload'] = $true
+    $armedMenu = Get-RenderedMenu -MenuConfig $armedConfig
+    Assert-PubTest ($armedMenu -match 'ORIGINALS DELETED') 'arming source deletion is visible on the main menu at all times'
+
+    # Width: a console menu that wraps is unreadable. Checked on the composed
+    # lines, because colouring splits each printed line into two segments.
+    $composed = @()
+    foreach ($number in $briefLabels.Keys) {
+        $composed += Format-PubMenuOptionLine -Number $number -Label $briefLabels[$number] -Note 'needs Publisher'
+    }
+    $composed += Format-PubMenuOptionLine -Number '13' -Label 'Change conversion & upload settings' -Note 'rules, folders'
+    $composed += Format-PubMenuStatusLine -Label 'Site discovery' -Value 'tenant admin list - finds every site (test with option 3)'
+    $composed += Format-PubMenuStatusLine -Label 'Tenant access'  -Value 'CERTIFICATE EXPIRED 2026-09-08 - run option 2'
+    $composed += Format-PubMenuStatusLine -Label ' ' -Value '12 to download  |  30 to convert  |  170 to upload' -Continuation
+
+    $tooWide = @($composed | Where-Object { $_.Length -gt 80 })
+    Assert-PubTest ($tooWide.Count -eq 0) ('every composed menu line fits an 80-column console ({0} too wide)' -f $tooWide.Count)
+
+    $longest = Format-PubMenuOptionLine -Number '9' -Label $briefLabels['9'] -Note '170 ready'
+    Assert-PubTest ($longest -match 'location\s\s+170 ready') 'the longest label still leaves a gap before its note'
+
+    foreach ($rendered in @($freshMenu, $menuPending, $menuExpired, $armedMenu, $selectionMenu)) {
+        foreach ($line in ($rendered -split "`r?`n")) {
+            if ($line.TrimEnd().Length -gt 80) { $tooWide += $line }
+        }
+    }
+    Assert-PubTest ($tooWide.Count -eq 0) 'no rendered menu line exceeds 80 columns either'
+
+    # Input handling: invalid entries re-prompt rather than erroring out.
+    $script:MenuAnswers = New-Object System.Collections.Generic.Queue[string]
+    function global:Read-Host { param([string] $Prompt) return $script:MenuAnswers.Dequeue() }
+
+    @('99', 'nonsense', '', '4') | ForEach-Object { $script:MenuAnswers.Enqueue($_) }
+    Assert-PubTest ((Read-PubMenuChoice -Valid @('0', '4') 6>$null) -eq '4') 'invalid input re-prompts until a valid option is entered'
+
+    @('q') | ForEach-Object { $script:MenuAnswers.Enqueue($_) }
+    Assert-PubTest ((Read-PubMenuChoice -Valid @('0', '1') 6>$null) -eq '0') 'typing q is treated as 0 (exit/back)'
+
+    @('back') | ForEach-Object { $script:MenuAnswers.Enqueue($_) }
+    Assert-PubTest ((Read-PubMenuChoice -Valid @('0', '1') 6>$null) -eq '0') 'typing back is treated as 0'
+
+    @('3)') | ForEach-Object { $script:MenuAnswers.Enqueue($_) }
+    Assert-PubTest ((Read-PubMenuChoice -Valid @('0', '3') 6>$null) -eq '3') 'a stray bracket typed with the number is forgiven'
+
+    @(' 2 ') | ForEach-Object { $script:MenuAnswers.Enqueue($_) }
+    Assert-PubTest ((Read-PubMenuChoice -Valid @('0', '2') 6>$null) -eq '2') 'surrounding whitespace is forgiven'
+
+    Remove-Item -Path 'function:global:Read-Host' -ErrorAction SilentlyContinue
+
+    # -----------------------------------------------------------------------
     Write-PubTestSection 'Logging'
     # -----------------------------------------------------------------------
     Write-PubFileResult -Outcome Converted -FileName 'Newsletter.pub' -Detail 'Newsletter.pdf'

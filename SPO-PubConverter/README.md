@@ -48,6 +48,76 @@ Then, first time through:
 `10` runs 4 → 9 in one go after a single typed confirmation. `0` exits from any
 menu level; anything unrecognised simply re-prompts.
 
+## The menu
+
+Everything is driven from one numbered menu that redisplays after each action,
+so several phases can be run back to back. It shows where the run currently
+stands, and tells you which option to pick next:
+
+```
+==============================================================================
+   SharePoint Publisher File Converter                                  v1.0
+==============================================================================
+  Tenant         : contoso.onmicrosoft.com
+  Tenant access  : ready - certificate expires 2028-09-11
+  Site discovery : tenant admin list - finds every site (test with option 3)
+  File list      : PublisherFileInventory_2026-09-11_1030.csv (214 files)
+                   12 to download  |  30 to convert  |  170 to upload
+                   2 failed
+  Working on     : every row in the file list
+  Settings       : existing PDF: Version  |  name clashes: Version
+                   originals kept
+------------------------------------------------------------------------------
+  NEXT: option 7 - download the 12 file(s) not yet on this machine
+------------------------------------------------------------------------------
+
+  SETUP - do these once, in order
+    1) Generate or connect Azure AD App Registration          done
+    2) Generate & upload authentication certificate           done
+    3) Test connection to Microsoft Graph / SharePoint        verify setup
+
+  DISCOVERY - find the Publisher files
+    4) Scan tenant for Publisher (.pub) files
+    5) Export / re-export scan results to CSV                 214 rows
+
+  CONVERSION - fetch the files and make the PDFs
+    6) Load a CSV and select files to process                 change files
+    7) Download selected files                                12 to download
+    8) Convert downloaded files to PDF                        no Publisher
+
+  PUBLISH - put the PDFs back in SharePoint
+    9) Upload converted PDFs to original SharePoint location  170 ready
+
+  UTILITIES
+   10) Run full pipeline (4 -> 9) unattended                  no Publisher
+   11) View recent log                                        run history
+   12) Open working folder                                    files on disk
+   13) Change conversion & upload settings                    rules, folders
+
+    0) Exit
+------------------------------------------------------------------------------
+ Select an option:
+```
+
+Reading it:
+
+- **The state block** says what is set up, which file list is loaded, how many
+  files are at each stage, and whether the tool is working on everything or a
+  subset you narrowed at option 6. Anything dangerous is spelled out here —
+  `ORIGINALS DELETED after upload` appears the moment that setting is armed.
+- **NEXT** names the single option to pick next, worked out from what is
+  actually outstanding. An expired certificate outranks everything else.
+- **The second column** is per-option status: `done`, `12 to download`,
+  `no Publisher`, `needs setup`. Steps that cannot run yet are dimmed and say
+  why rather than failing after you pick them.
+- **0 always goes back or exits**, at every level. Typing `q`, `back` or `x`
+  is treated the same way, a stray `)` or spaces are forgiven, and anything
+  unrecognised re-prompts with the valid choices rather than erroring out.
+
+Sub-menus follow the same convention — numbered, described, `0` last. The
+status filter, for example, lists what each stage means with a live count, so
+"retry just the failures" is one keystroke rather than a guess.
+
 ## Prerequisites
 
 | Requirement | Needed for | Notes |
@@ -353,14 +423,15 @@ and `Upload.psm1` import it rather than defining the format again.
 .\tests\Run-Tests.ps1
 ```
 
-103 offline checks: every file parses and every module imports, the CSV schema
+123 offline checks: every file parses and every module imports, the CSV schema
 matches the brief exactly, local paths mirror SharePoint without collisions,
 filters and status counts behave, config round-trips without persisting
 secrets, certificate expiry warns at the right thresholds, the
 skip/overwrite/version rule does what it says, scope files load (including the
 SharePoint admin centre export unedited), the permission scopes stay separated
-and app role ids resolve live, and the preserved parts of Tom's
-conversion script (the Interop enum, the COM pattern, `app.Quit()` in
+and app role ids resolve live, the menu renders correctly in every state
+(right options, right order, correct next step, nothing wider than 80
+columns), and the preserved parts of Tom's conversion script (the Interop enum, the COM pattern, `app.Quit()` in
 `finally`) are still there. Nothing touches a tenant, so it is safe to run any
 time — including on the Linux/macOS host you might be editing from.
 

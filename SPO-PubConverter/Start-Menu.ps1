@@ -22,6 +22,10 @@
 .PARAMETER WorkingFolder
     Override the working folder for this session (also settable at option 13).
 
+.PARAMETER NoRun
+    Load the functions without showing the menu. Used by tests/Run-Tests.ps1 to
+    render and assert on the menu without going interactive.
+
 .EXAMPLE
     .\Start-Menu.ps1
 
@@ -32,7 +36,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $WorkingFolder
+    [string] $WorkingFolder,
+    [switch] $NoRun
 )
 
 Set-StrictMode -Version 2.0
@@ -52,6 +57,7 @@ $script:Inventory     = @()
 $script:InventoryPath = ''
 $script:Selection     = @()
 $script:Version       = 'v1.0'
+$script:VerifiedRoute = ''   # set by option 3 once the route has really been tested
 
 if ($WorkingFolder) {
     $script:Config['DefaultWorkingFolder'] = $WorkingFolder
@@ -91,11 +97,19 @@ function Read-PubMenuChoice {
 
     while ($true) {
         $answer = Read-Host $Prompt
-        if ($null -ne $answer) { $answer = $answer.Trim() }
+        if ($null -ne $answer) { $answer = $answer.Trim().TrimEnd(')') }
 
         if ($Valid -contains $answer) { return $answer }
 
-        Write-Host (' "{0}" is not one of the options. Enter a number from the list.' -f $answer) -ForegroundColor Yellow
+        # Technicians type these out of habit - treat them as "0" rather than
+        # scolding, since 0 always means back or exit.
+        if ($Valid -contains '0' -and $answer -match '^(q|quit|exit|b|back|x)$') { return '0' }
+
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            Write-Host ' Enter one of the numbers listed (0 goes back).' -ForegroundColor Yellow
+        } else {
+            Write-Host (' "{0}" is not an option here. Valid choices: {1}' -f $answer, ($Valid -join ', ')) -ForegroundColor Yellow
+        }
     }
 }
 
@@ -113,78 +127,495 @@ function Confirm-PubAction {
     return ($answer -match '^[Yy]')
 }
 
+function Get-PubMenuWidth {
+    [CmdletBinding()]
+    param()
+    return 78
+}
+
+function Write-PubMenuRule {
+    [CmdletBinding()]
+    param([string] $Character = '-', [string] $Colour = 'DarkGray')
+    Write-Host ($Character * (Get-PubMenuWidth)) -ForegroundColor $Colour
+}
+
+function Format-PubMenuStatusLine {
+    <#
+    .SYNOPSIS
+        Composes one 'Label : value' line of the state block.
+
+    .DESCRIPTION
+        Formatting is separated from colouring so the composed line can be
+        width-checked by the tests - a console menu that wraps is unreadable,
+        and the colour segments hide the true line length otherwise.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Label,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Value,
+        [switch] $Continuation
+    )
+
+    return ((Get-PubMenuStatusPrefix -Label $Label -Continuation:$Continuation) + $Value)
+}
+
+function Get-PubMenuStatusPrefix {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Label,
+        [switch] $Continuation
+    )
+
+    if ($Continuation) { return (' ' * 19) }
+    return ('  {0} : ' -f $Label.PadRight(14))
+}
+
+function Write-PubMenuStatusLine {
+    <#
+    .SYNOPSIS
+        One aligned 'Label : value' line in the menu's state block.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Label,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Value,
+        [string] $Colour = 'Gray',
+        [switch] $Continuation
+    )
+
+    Write-Host (Get-PubMenuStatusPrefix -Label $Label -Continuation:$Continuation) -NoNewline
+    Write-Host $Value -ForegroundColor $Colour
+}
+
+function Write-PubMenuWrappedValue {
+    <#
+    .SYNOPSIS
+        Writes a 'Label : a  |  b  |  c' line, wrapping onto aligned
+        continuation lines so it never runs past 80 columns.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Label,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Parts,
+        [string] $Colour = 'Gray',
+        [int]    $MaxWidth = 57,
+        [switch] $Continuation
+    )
+
+    if (-not $Parts -or $Parts.Count -eq 0) { return }
+
+    $line  = ''
+    $first = -not $Continuation
+
+    foreach ($part in $Parts) {
+        $candidate = $part
+        if ($line) { $candidate = '{0}  |  {1}' -f $line, $part }
+
+        if ($candidate.Length -gt $MaxWidth -and $line) {
+            if ($first) { Write-PubMenuStatusLine -Label $Label -Value $line -Colour $Colour; $first = $false }
+            else        { Write-PubMenuStatusLine -Label ' ' -Value $line -Colour $Colour -Continuation }
+            $line = $part
+        } else {
+            $line = $candidate
+        }
+    }
+
+    if ($line) {
+        if ($first) { Write-PubMenuStatusLine -Label $Label -Value $line -Colour $Colour }
+        else        { Write-PubMenuStatusLine -Label ' ' -Value $line -Colour $Colour -Continuation }
+    }
+}
+
+function Get-PubMenuNoteColumn {
+    [CmdletBinding()]
+    param()
+    # 62 clears the longest label (option 9) by two spaces; notes are kept to
+    # 14 characters or fewer so the whole line fits an 80-column console.
+    return 62
+}
+
+function Format-PubMenuOptionLine {
+    <#
+    .SYNOPSIS
+        Composes one option line, with its note in the second column.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Number,
+        [Parameter(Mandatory)] [string] $Label,
+        [string] $Note
+    )
+
+    $text = '  {0}) {1}' -f $Number.PadLeft(3), $Label
+    if ([string]::IsNullOrWhiteSpace($Note)) { return $text }
+
+    return ($text.PadRight((Get-PubMenuNoteColumn)) + $Note)
+}
+
+function Write-PubMenuOption {
+    <#
+    .SYNOPSIS
+        One menu option, with its status note aligned in a second column.
+
+    .PARAMETER Note
+        Short status for this option - what is done, what is waiting, or why
+        it cannot run yet. This is what stops the operator guessing which step
+        they are on.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Number,
+        [Parameter(Mandatory)] [string] $Label,
+        [string] $Note,
+        [ValidateSet('Normal', 'Done', 'Next', 'Waiting', 'Blocked')]
+        [string] $State = 'Normal'
+    )
+
+    $line   = Format-PubMenuOptionLine -Number $Number -Label $Label -Note $Note
+    $column = Get-PubMenuNoteColumn
+
+    $labelColour = 'White'
+    if ($State -eq 'Blocked') { $labelColour = 'DarkGray' }
+    if ($State -eq 'Next')    { $labelColour = 'Cyan' }
+
+    if ([string]::IsNullOrWhiteSpace($Note) -or $line.Length -le $column) {
+        Write-Host $line -ForegroundColor $labelColour
+        return
+    }
+
+    $noteColour = 'DarkGray'
+    switch ($State) {
+        'Done'    { $noteColour = 'Green' }
+        'Next'    { $noteColour = 'Cyan' }
+        'Waiting' { $noteColour = 'Yellow' }
+        'Blocked' { $noteColour = 'Red' }
+    }
+
+    Write-Host $line.Substring(0, $column) -ForegroundColor $labelColour -NoNewline
+    Write-Host $line.Substring($column) -ForegroundColor $noteColour
+}
+
+function Get-PubMenuState {
+    <#
+    .SYNOPSIS
+        Everything the menu needs to describe itself, computed once per render.
+
+    .DESCRIPTION
+        Deliberately cheap: no network calls. The discovery route is inferred
+        from configuration and the cached PnP probe, and replaced with the
+        verified result once option 3 has actually tested it.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $config = $script:Config
+
+    $state = @{
+        HasApp        = -not [string]::IsNullOrWhiteSpace([string] $config['AppId'])
+        HasCert       = -not [string]::IsNullOrWhiteSpace([string] $config['CertificateThumbprint'])
+        CertState     = 'Unknown'
+        CertMessage   = ''
+        HasInventory  = ($script:Inventory -and @($script:Inventory).Count -gt 0)
+        Stats         = $null
+        TotalRows     = @($script:Inventory).Count
+        RowsToProcess = 0
+        Pending       = 0
+        Downloaded    = 0
+        Converted     = 0
+        Uploaded      = 0
+        Failed        = 0
+        Publisher     = (Test-PubPublisherAvailable -Quiet)
+    }
+
+    $expiry              = Test-PubCertificateExpiry -Config $config -Quiet
+    $state['CertState']  = $expiry.State
+    $state['CertMessage'] = $expiry.Message
+
+    if ($state['HasInventory']) {
+        $rows  = Get-PubRowsToProcess
+        $stats = Get-PubInventoryStatistic -Rows $rows
+
+        $state['Stats']         = $stats
+        $state['RowsToProcess'] = $stats.Total
+        $state['Pending']       = $stats.Pending
+        $state['Downloaded']    = $stats.Downloaded
+        $state['Converted']     = $stats.Converted
+        $state['Uploaded']      = $stats.Uploaded
+        $state['Failed']        = $stats.Failed
+    }
+
+    return $state
+}
+
+function Get-PubDiscoveryRouteLabel {
+    <#
+    .SYNOPSIS
+        Describes how discovery will find sites, in plain words.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:VerifiedRoute) { return $script:VerifiedRoute }
+
+    if ([string]::IsNullOrWhiteSpace([string] $script:Config['AppId'])) {
+        return 'set up tenant access first (option 1)'
+    }
+
+    $method = [string] $script:Config['EnumerationMethod']
+    if ([string]::IsNullOrWhiteSpace($method)) { $method = 'Auto' }
+
+    if ([string] $script:Config['AuthMethod'] -eq 'SitesSelected') {
+        return 'only the sites granted to this app'
+    }
+
+    if ($method -ne 'Graph' -and ([string] $script:Config['AuthMethod'] -eq 'TenantAdmin') -and (Test-PubPnPAvailable -Quiet)) {
+        return 'tenant admin list - finds every site (test with option 3)'
+    }
+
+    return 'Graph search - may miss some sites (see README)'
+}
+
+function Get-PubNextStep {
+    <#
+    .SYNOPSIS
+        Works out the one thing the operator should do next.
+
+    .OUTPUTS
+        A hashtable with Option and Text, or Option = '' when there is nothing
+        outstanding.
+    #>
+    [CmdletBinding()]
+    param($State)
+
+    if (-not $State) { $State = Get-PubMenuState }
+
+    if (-not $State['HasApp']) {
+        return @{ Option = '1'; Text = 'set up access to the tenant (first time here)' }
+    }
+    if (-not $State['HasCert']) {
+        return @{ Option = '2'; Text = 'create the certificate this tool signs in with' }
+    }
+    if ($State['CertState'] -eq 'Expired') {
+        return @{ Option = '2'; Text = 'certificate expired - replace it before anything else' }
+    }
+
+    if (-not $State['HasInventory']) {
+        $last = [string] $script:Config['LastInventoryCsv']
+        if (-not [string]::IsNullOrWhiteSpace($last) -and (Test-Path -LiteralPath $last)) {
+            return @{ Option = '6'; Text = 'load the CSV from your last run and carry on' }
+        }
+        return @{ Option = '4'; Text = 'scan SharePoint to find the .pub files' }
+    }
+
+    if ($State['Pending'] -gt 0)    { return @{ Option = '7'; Text = ('download the {0} file(s) not yet on this machine' -f $State['Pending']) } }
+    if ($State['Downloaded'] -gt 0) { return @{ Option = '8'; Text = ('convert the {0} downloaded file(s) to PDF' -f $State['Downloaded']) } }
+    if ($State['Converted'] -gt 0)  { return @{ Option = '9'; Text = ('upload the {0} finished PDF(s) back to SharePoint' -f $State['Converted']) } }
+
+    if ($State['Failed'] -gt 0) {
+        return @{ Option = '6'; Text = ('everything else is done - {0} row(s) failed, select them to retry' -f $State['Failed']) }
+    }
+
+    return @{ Option = ''; Text = 'all rows in this inventory are uploaded - nothing outstanding' }
+}
+
 function Get-PubInventoryLabel {
     <#
     .SYNOPSIS
-        The 'Last inventory' line for the menu header.
+        The inventory line for the menu header.
     #>
     [CmdletBinding()]
     param()
 
     if ($script:Inventory -and @($script:Inventory).Count -gt 0) {
-        $statistics = Get-PubInventoryStatistic -Rows $script:Inventory
-        return ('{0} ({1} rows: {2} pending, {3} converted, {4} uploaded, {5} failed)' -f `
-            (Split-Path -Leaf $script:InventoryPath), $statistics.Total, $statistics.Pending, $statistics.Converted, $statistics.Uploaded, $statistics.Failed)
+        $name = Split-Path -Leaf $script:InventoryPath
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = 'unsaved scan results' }
+        return ('{0} ({1} files)' -f $name, @($script:Inventory).Count)
     }
 
     $last = [string] $script:Config['LastInventoryCsv']
     if (-not [string]::IsNullOrWhiteSpace($last)) {
-        if (Test-Path -LiteralPath $last) { return ('{0} (not loaded - use option 6)' -f (Split-Path -Leaf $last)) }
+        if (Test-Path -LiteralPath $last) { return ('{0} (not loaded yet - option 6)' -f (Split-Path -Leaf $last)) }
         return ('{0} (file no longer present)' -f (Split-Path -Leaf $last))
     }
 
-    return 'none yet - run option 4'
+    return 'none yet - run option 4 to scan'
 }
 
 function Show-PubMainMenu {
+    <#
+    .SYNOPSIS
+        Renders the main menu: current state, the next step, then the options.
+    #>
     [CmdletBinding()]
-    param()
+    param(
+        [switch] $NoClear
+    )
 
-    $script:Config = Get-PubConfig
+    $state = Get-PubMenuState
+    $next  = Get-PubNextStep -State $state
 
-    $tenant = [string] $script:Config['TenantDomain']
-    if ([string]::IsNullOrWhiteSpace($tenant)) { $tenant = [string] $script:Config['TenantId'] }
-    if ([string]::IsNullOrWhiteSpace($tenant)) { $tenant = 'not configured' }
-
-    $appStatus       = Get-PubAppRegistrationStatus -Config $script:Config
-    $selectionLabel  = 'all rows'
-    if ($script:Selection -and @($script:Selection).Count -gt 0) {
-        $selectionLabel = ('{0} row(s) selected' -f @($script:Selection).Count)
+    if (-not $NoClear) {
+        try { Clear-Host } catch { }
     }
 
-    Clear-Host
-    Write-Host '=====================================================' -ForegroundColor Cyan
-    Write-Host ('   SharePoint Publisher File Converter   {0}' -f $script:Version) -ForegroundColor Cyan
-    Write-Host '=====================================================' -ForegroundColor Cyan
-    Write-Host (' Tenant: {0}      App reg: {1}' -f $tenant, $appStatus)
-    Write-Host (' Last inventory: {0}' -f (Get-PubInventoryLabel))
-    Write-Host (' Selection: {0}   Existing PDF: {1}   Collisions: {2}' -f $selectionLabel, $script:Config['ExistingPdfAction'], $script:Config['UploadConflictAction'])
-    Write-Host '-----------------------------------------------------' -ForegroundColor DarkGray
-    Write-Host '  SETUP'
-    Write-Host '   1) Generate or connect Azure AD App Registration'
-    Write-Host '   2) Generate & upload authentication certificate'
-    Write-Host '   3) Test connection to Microsoft Graph / SharePoint'
+    $width = Get-PubMenuWidth
+
+    Write-PubMenuRule -Character '=' -Colour Cyan
+    Write-Host ('   SharePoint Publisher File Converter'.PadRight($width - 6) + $script:Version) -ForegroundColor Cyan
+    Write-PubMenuRule -Character '=' -Colour Cyan
+
+    # ---- where things stand ----
+    $tenant = [string] $script:Config['TenantDomain']
+    if ([string]::IsNullOrWhiteSpace($tenant)) { $tenant = [string] $script:Config['TenantId'] }
+    if ([string]::IsNullOrWhiteSpace($tenant)) { $tenant = 'not set up yet' }
+    Write-PubMenuStatusLine -Label 'Tenant' -Value $tenant
+
+    $accessValue  = 'not set up yet - start at option 1'
+    $accessColour = 'Yellow'
+    if ($state['HasApp'] -and $state['HasCert']) {
+        switch ($state['CertState']) {
+            'Valid'    { $accessValue = ('ready - certificate expires {0}' -f $script:Config['CertificateExpiry']); $accessColour = 'Green' }
+            'Expiring' { $accessValue = ('certificate expires {0} - renew soon (option 2)' -f $script:Config['CertificateExpiry']); $accessColour = 'Yellow' }
+            'Expired'  { $accessValue = ('CERTIFICATE EXPIRED {0} - run option 2' -f $script:Config['CertificateExpiry']); $accessColour = 'Red' }
+            default    { $accessValue = 'configured - expiry unknown'; $accessColour = 'Yellow' }
+        }
+    } elseif ($state['HasApp']) {
+        $accessValue = 'app registered, certificate still needed - option 2'
+    }
+    Write-PubMenuStatusLine -Label 'Tenant access' -Value $accessValue -Colour $accessColour
+    Write-PubMenuStatusLine -Label 'Site discovery' -Value (Get-PubDiscoveryRouteLabel)
+    Write-PubMenuStatusLine -Label 'File list' -Value (Get-PubInventoryLabel)
+
+    if ($state['HasInventory']) {
+        $stats = $state['Stats']
+
+        # Only the states that actually have rows, wrapped so a busy inventory
+        # still fits an 80-column console.
+        $parts = New-Object System.Collections.Generic.List[string]
+        if ($stats.Pending -gt 0)    { $parts.Add(('{0} to download' -f $stats.Pending)) }
+        if ($stats.Downloaded -gt 0) { $parts.Add(('{0} to convert'  -f $stats.Downloaded)) }
+        if ($stats.Converted -gt 0)  { $parts.Add(('{0} to upload'   -f $stats.Converted)) }
+        if ($stats.Uploaded -gt 0)   { $parts.Add(('{0} uploaded'    -f $stats.Uploaded)) }
+        if ($stats.Failed -gt 0)     { $parts.Add(('{0} failed'      -f $stats.Failed)) }
+        if ($stats.Skipped -gt 0)    { $parts.Add(('{0} skipped'     -f $stats.Skipped)) }
+        if ($parts.Count -eq 0)      { $parts.Add('nothing to do') }
+
+        Write-PubMenuWrappedValue -Label ' ' -Parts $parts.ToArray() -Continuation
+
+        if ($script:Selection -and @($script:Selection).Count -gt 0) {
+            Write-PubMenuStatusLine -Label 'Working on' -Value ('{0} of {1} row(s) you selected at option 6' -f @($script:Selection).Count, @($script:Inventory).Count) -Colour Yellow
+        } else {
+            Write-PubMenuStatusLine -Label 'Working on' -Value 'every row in the file list'
+        }
+    }
+
+    $removeLabel = 'originals kept'
+    if ([bool] $script:Config['RemoveSourceAfterUpload']) { $removeLabel = 'ORIGINALS DELETED after upload' }
+
+    Write-PubMenuWrappedValue -Label 'Settings' -Parts @(
+        ('existing PDF: {0}' -f $script:Config['ExistingPdfAction'])
+        ('name clashes: {0}' -f $script:Config['UploadConflictAction'])
+        $removeLabel
+    )
+
+    # ---- what to do next ----
+    Write-PubMenuRule
+    if ($next['Option']) {
+        Write-Host '  NEXT: ' -ForegroundColor Cyan -NoNewline
+        Write-Host ('option {0} - {1}' -f $next['Option'], $next['Text'])
+    } else {
+        Write-Host '  NEXT: ' -ForegroundColor Green -NoNewline
+        Write-Host $next['Text']
+    }
+
+    if (-not $state['Publisher']) {
+        Write-Host '  NOTE: ' -ForegroundColor Yellow -NoNewline
+        Write-Host 'Publisher not installed here - options 8 and 10 must run elsewhere.'
+    }
+    Write-PubMenuRule
+
+    # ---- the options ----
+    $nextOption = [string] $next['Option']
+    function Get-PubOptionState {
+        param([string] $Number, [string] $Default = 'Normal')
+        if ($Number -eq $nextOption) { return 'Next' }
+        return $Default
+    }
+
     Write-Host ''
-    Write-Host '  DISCOVERY'
-    Write-Host '   4) Scan tenant for Publisher (.pub) files'
-    Write-Host '   5) Export / re-export scan results to CSV'
+    Write-Host '  SETUP - do these once, in order' -ForegroundColor White
+
+    $appNote = 'not done yet'; $appState = 'Waiting'
+    if ($state['HasApp']) { $appNote = 'done'; $appState = 'Done' }
+    Write-PubMenuOption -Number '1' -Label 'Generate or connect Azure AD App Registration' -Note $appNote -State (Get-PubOptionState -Number '1' -Default $appState)
+
+    $certNote = 'not done yet'; $certState = 'Waiting'
+    if ($state['HasCert']) {
+        switch ($state['CertState']) {
+            'Valid'    { $certNote = 'done';          $certState = 'Done' }
+            'Expiring' { $certNote = 'expiring soon'; $certState = 'Waiting' }
+            'Expired'  { $certNote = 'EXPIRED';       $certState = 'Blocked' }
+            default    { $certNote = 'done';          $certState = 'Done' }
+        }
+    }
+    Write-PubMenuOption -Number '2' -Label 'Generate & upload authentication certificate' -Note $certNote -State (Get-PubOptionState -Number '2' -Default $certState)
+    Write-PubMenuOption -Number '3' -Label 'Test connection to Microsoft Graph / SharePoint' -Note 'verify setup' -State (Get-PubOptionState -Number '3')
+
     Write-Host ''
-    Write-Host '  CONVERSION'
-    Write-Host '   6) Load a CSV and select files to process'
-    Write-Host '   7) Download selected files'
-    Write-Host '   8) Convert downloaded files to PDF'
+    Write-Host '  DISCOVERY - find the Publisher files' -ForegroundColor White
+
+    $scanNote = 'needs setup'; $scanState = 'Blocked'
+    if ($state['HasApp'] -and $state['HasCert']) { $scanNote = ''; $scanState = 'Normal' }
+    Write-PubMenuOption -Number '4' -Label 'Scan tenant for Publisher (.pub) files' -Note $scanNote -State (Get-PubOptionState -Number '4' -Default $scanState)
+
+    $exportNote = 'no scan yet'; $exportState = 'Blocked'
+    if ($state['HasInventory']) { $exportNote = ('{0} rows' -f $state['TotalRows']); $exportState = 'Normal' }
+    Write-PubMenuOption -Number '5' -Label 'Export / re-export scan results to CSV' -Note $exportNote -State (Get-PubOptionState -Number '5' -Default $exportState)
+
     Write-Host ''
-    Write-Host '  PUBLISH'
-    Write-Host '   9) Upload converted PDFs to original SharePoint location'
+    Write-Host '  CONVERSION - fetch the files and make the PDFs' -ForegroundColor White
+
+    $loadNote = 'none loaded'
+    if ($state['HasInventory']) { $loadNote = 'change files' }
+    Write-PubMenuOption -Number '6' -Label 'Load a CSV and select files to process' -Note $loadNote -State (Get-PubOptionState -Number '6')
+
+    $downloadNote = 'no file list'; $downloadState = 'Blocked'
+    if ($state['HasInventory']) {
+        if ($state['Pending'] -gt 0) { $downloadNote = ('{0} to download' -f $state['Pending']); $downloadState = 'Normal' }
+        else { $downloadNote = 'none waiting'; $downloadState = 'Normal' }
+    }
+    Write-PubMenuOption -Number '7' -Label 'Download selected files' -Note $downloadNote -State (Get-PubOptionState -Number '7' -Default $downloadState)
+
+    $convertNote = 'no file list'; $convertState = 'Blocked'
+    if (-not $state['Publisher']) {
+        $convertNote = 'no Publisher'; $convertState = 'Blocked'
+    } elseif ($state['HasInventory']) {
+        if ($state['Downloaded'] -gt 0) { $convertNote = ('{0} ready' -f $state['Downloaded']); $convertState = 'Normal' }
+        else { $convertNote = 'none ready'; $convertState = 'Normal' }
+    }
+    Write-PubMenuOption -Number '8' -Label 'Convert downloaded files to PDF' -Note $convertNote -State (Get-PubOptionState -Number '8' -Default $convertState)
+
     Write-Host ''
-    Write-Host '  UTILITIES'
-    Write-Host '  10) Run full pipeline (4 -> 9) unattended'
-    Write-Host '  11) View recent log'
-    Write-Host '  12) Open working folder'
-    Write-Host '  13) Change conversion & upload settings'
+    Write-Host '  PUBLISH - put the PDFs back in SharePoint' -ForegroundColor White
+
+    $uploadNote = 'none ready'; $uploadState = 'Blocked'
+    if ($state['Converted'] -gt 0) { $uploadNote = ('{0} ready' -f $state['Converted']); $uploadState = 'Normal' }
+    Write-PubMenuOption -Number '9' -Label 'Upload converted PDFs to original SharePoint location' -Note $uploadNote -State (Get-PubOptionState -Number '9' -Default $uploadState)
+
     Write-Host ''
-    Write-Host '   0) Exit'
-    Write-Host '-----------------------------------------------------' -ForegroundColor DarkGray
+    Write-Host '  UTILITIES' -ForegroundColor White
+
+    $pipelineNote = 'all steps'
+    $pipelineState = 'Normal'
+    if (-not $state['Publisher']) { $pipelineNote = 'no Publisher'; $pipelineState = 'Blocked' }
+    Write-PubMenuOption -Number '10' -Label 'Run full pipeline (4 -> 9) unattended' -Note $pipelineNote -State $pipelineState
+    Write-PubMenuOption -Number '11' -Label 'View recent log' -Note 'run history'
+    Write-PubMenuOption -Number '12' -Label 'Open working folder' -Note 'files on disk'
+    Write-PubMenuOption -Number '13' -Label 'Change conversion & upload settings' -Note 'rules, folders'
+
+    Write-Host ''
+    Write-PubMenuOption -Number '0' -Label 'Exit'
+    Write-PubMenuRule
 }
 
 # ---------------------------------------------------------------------------
@@ -234,7 +665,7 @@ function Invoke-PubCreateAppRegistration {
     }
 
     Write-Host ''
-    Write-Host '  How much access should this app have?' -ForegroundColor Cyan
+    Write-Host '  HOW MUCH ACCESS SHOULD THIS APP HAVE?' -ForegroundColor Cyan
     Write-Host '   1) Tenant-wide + SharePoint admin - FULLY AUTOMATIC site discovery'
     Write-Host '      Adds SharePoint Sites.FullControl.All so discovery can read the tenant'
     Write-Host '      admin site list. Finds every site with no manual export. Largest grant:'
@@ -266,7 +697,8 @@ function Invoke-PubCreateAppRegistration {
     # together, so options 1 and 2 collapse into a single action.
     if (Test-PubPnPAvailable -Quiet) {
         Write-Host ''
-        Write-Host '  PnP PowerShell is available on this host.' -ForegroundColor Cyan
+        Write-Host '  SETUP STYLE' -ForegroundColor Cyan
+        Write-Host '  PnP PowerShell is available on this host.'
         Write-Host '   1) One-step setup with PnP (app + certificate + consent together)'
         Write-Host '   2) Step-by-step with Graph (app now, certificate at option 2)'
         Write-Host '   0) Cancel'
@@ -501,6 +933,7 @@ function Invoke-PubGrantSiteAccess {
     if ([string]::IsNullOrWhiteSpace($siteUrl)) { return }
 
     Write-Host ''
+    Write-Host '  ACCESS LEVEL FOR THIS SITE' -ForegroundColor Cyan
     Write-Host '   1) Read and write (needed for the full pipeline)'
     Write-Host '   2) Read only (discovery and download only)'
     Write-Host '   0) Cancel'
@@ -752,20 +1185,21 @@ function Invoke-PubSelectionMenu {
 
     while ($true) {
         $selectionCount = @($script:Selection).Count
-        $label = 'all rows'
-        if ($selectionCount -gt 0) { $label = ('{0} row(s)' -f $selectionCount) }
+        $label = ('every row in the CSV ({0})' -f @($script:Inventory).Count)
+        if ($selectionCount -gt 0) { $label = ('{0} of {1} row(s)' -f $selectionCount, @($script:Inventory).Count) }
 
         Write-Host ''
         Write-Host '  SELECT FILES TO PROCESS' -ForegroundColor Cyan
-        Write-Host ('  Currently selected: {0}' -f $label)
+        Write-Host ('  Options 7, 8 and 9 will act on: {0}' -f $label) -ForegroundColor Yellow
+        Write-Host '  Filters stack, so you can narrow twice (site, then status).'
         Write-Host ''
-        Write-Host '   1) Process every row in this CSV'
-        Write-Host '   2) Filter by site URL'
-        Write-Host '   3) Filter by library or folder path'
-        Write-Host '   4) Filter by file name'
-        Write-Host '   5) Filter by status (e.g. only Failed, only Pending)'
-        Write-Host '   6) Show the rows currently selected'
-        Write-Host '   0) Done - keep this selection'
+        Write-Host '   1) Process every row in this CSV (clear any filters)'
+        Write-Host '   2) Narrow down by site URL'
+        Write-Host '   3) Narrow down by library or folder path'
+        Write-Host '   4) Narrow down by file name'
+        Write-Host '   5) Narrow down by status (e.g. retry only the failures)'
+        Write-Host '   6) Show me the rows currently selected'
+        Write-Host '   0) Done - use this selection'
         Write-Host ''
 
         switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5', '6')) {
@@ -786,11 +1220,23 @@ function Invoke-PubSelectionMenu {
                 if ($pattern) { Set-PubSelection -NameFilter ('*{0}*' -f $pattern.Trim('*')) }
             }
             '5' {
+                $source = $script:Selection
+                if (-not $source -or @($source).Count -eq 0) { $source = $script:Inventory }
+                $counts = Get-PubInventoryStatistic -Rows $source
+
                 Write-Host ''
-                Write-Host '   1) Pending      2) Downloaded   3) Converted'
-                Write-Host '   4) Uploaded     5) Failed       6) Skipped'
+                Write-Host '  FILTER BY STATUS' -ForegroundColor Cyan
+                Write-Host '  Keep only the rows at one stage of the pipeline.'
+                Write-Host ''
+                Write-Host ('   1) Pending     - found in SharePoint, not downloaded yet   ({0})' -f $counts.Pending)
+                Write-Host ('   2) Downloaded  - on this machine, not converted yet        ({0})' -f $counts.Downloaded)
+                Write-Host ('   3) Converted   - PDF made, not uploaded yet                ({0})' -f $counts.Converted)
+                Write-Host ('   4) Uploaded    - finished, PDF is back in SharePoint       ({0})' -f $counts.Uploaded)
+                Write-Host ('   5) Failed      - something went wrong, retry these         ({0})' -f $counts.Failed)
+                Write-Host ('   6) Skipped     - deliberately left alone                   ({0})' -f $counts.Skipped)
                 Write-Host '   0) Cancel'
                 Write-Host ''
+
                 $statusMap = @{ '1' = 'Pending'; '2' = 'Downloaded'; '3' = 'Converted'; '4' = 'Uploaded'; '5' = 'Failed'; '6' = 'Skipped' }
                 $answer    = Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5', '6')
                 if ($answer -ne '0') { Set-PubSelection -Status @($statusMap[$answer]) }
@@ -1053,6 +1499,7 @@ function Invoke-PubSettingsMenu {
                 Write-Host '  site recycle bin). It stays off unless you turn it on here, and each upload' -ForegroundColor Yellow
                 Write-Host '  run still asks for a separate typed confirmation.' -ForegroundColor Yellow
                 Write-Host ''
+                Write-Host '  WHAT HAPPENS TO THE ORIGINAL .pub' -ForegroundColor Cyan
                 Write-Host '   1) No - upload the PDF alongside the .pub (default)'
                 Write-Host '   2) Yes - delete the .pub after its PDF uploads successfully'
                 Write-Host '   0) Cancel'
@@ -1080,7 +1527,7 @@ function Invoke-PubSettingsMenu {
             }
             '5' {
                 Write-Host ''
-                Write-Host '  How should discovery find sites?' -ForegroundColor Cyan
+                Write-Host '  HOW SHOULD DISCOVERY FIND SITES?' -ForegroundColor Cyan
                 Write-Host '   1) Auto      - SharePoint tenant admin list when available, else Graph (default)'
                 Write-Host '   2) PnP       - insist on the tenant admin list; report loudly if it is unavailable'
                 Write-Host '   3) Graph     - never use PnP, even when it is installed'
@@ -1111,7 +1558,7 @@ function Set-PubThreeWaySetting {
     )
 
     Write-Host ''
-    Write-Host ('  {0}' -f $Title) -ForegroundColor Cyan
+    Write-Host ('  {0}' -f $Title.ToUpper()) -ForegroundColor Cyan
     Write-Host '   1) Skip      - leave the existing file alone and move on'
     Write-Host '   2) Overwrite - replace the existing file'
     Write-Host '   3) Version   - keep both, writing Name (2).pdf / Name 1.pdf'
@@ -1143,8 +1590,10 @@ function Invoke-PubConnectionTest {
     Write-Host '  SITE ENUMERATION' -ForegroundColor Cyan
 
     if (Test-PubPnPEnumerationEnabled -Config $script:Config) {
+        $script:VerifiedRoute = 'tenant admin list - finds every site (tested OK)'
         Write-PubLog -Level Success -Message 'Tenant admin route available - discovery will find every site collection, including ones the search index misses.'
     } else {
+        $script:VerifiedRoute = 'Graph search - may miss some sites (tested)'
         Write-PubLog -Level Warn -Message 'Tenant admin route unavailable - discovery will fall back to Graph enumeration, which can miss unindexed sites, very new sites and Teams private-channel sites.'
         if (-not (Test-PubPnPAvailable -Quiet)) {
             Write-PubLog -Level Info -Message 'Install PnP PowerShell to enable it: Install-Module PnP.PowerShell -Scope CurrentUser'
@@ -1203,6 +1652,7 @@ function Start-PubMenu {
     Wait-PubKeyPress -Message 'Press any key to open the menu...'
 
     while ($true) {
+        $script:Config = Get-PubConfig
         Show-PubMainMenu
 
         $choice = Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13')
@@ -1242,4 +1692,6 @@ function Start-PubMenu {
     }
 }
 
-Start-PubMenu
+if (-not $NoRun) {
+    Start-PubMenu
+}
