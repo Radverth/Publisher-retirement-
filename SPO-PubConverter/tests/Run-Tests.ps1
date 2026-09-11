@@ -354,6 +354,13 @@ try {
     # Load the menu's functions without going interactive.
     . (Join-Path $projectRoot 'Start-Menu.ps1') -NoRun
 
+    function Copy-MenuConfig {
+        param($Source)
+        $copy = New-PubDefaultConfig
+        foreach ($key in $Source.Keys) { $copy[$key] = $Source[$key] }
+        return $copy
+    }
+
     function Get-RenderedMenu {
         param($MenuConfig, $MenuInventory = @(), $MenuSelection = @(), [string] $MenuPath = '')
 
@@ -415,10 +422,12 @@ try {
     $readyConfig['CertificateThumbprint'] = 'ABC123'
     $readyConfig['CertificateExpiry']     = (Get-Date).AddYears(2).ToString('yyyy-MM-dd')
 
-    $menuNoCert = Get-RenderedMenu -MenuConfig (@{} + $readyConfig + @{ CertificateThumbprint = '' })
+    $noCertConfig = Copy-MenuConfig -Source $readyConfig
+    $noCertConfig['CertificateThumbprint'] = ''
+    $menuNoCert = Get-RenderedMenu -MenuConfig $noCertConfig
     Assert-PubTest ($menuNoCert -match 'NEXT: option 2') 'an app with no certificate points at option 2'
 
-    $expiredConfig = @{} + $readyConfig
+    $expiredConfig = Copy-MenuConfig -Source $readyConfig
     $expiredConfig['CertificateExpiry'] = (Get-Date).AddDays(-2).ToString('yyyy-MM-dd')
     $menuExpired = Get-RenderedMenu -MenuConfig $expiredConfig
     Assert-PubTest ($menuExpired -match 'NEXT: option 2')     'an expired certificate takes priority over everything else'
@@ -459,7 +468,7 @@ try {
     Assert-PubTest ($selectionMenu -match 'Working on') 'a narrowed selection is stated in the header'
     Assert-PubTest ($selectionMenu -match '1 of 3')     'the header says how much of the inventory is selected'
 
-    $armedConfig = @{} + $readyConfig
+    $armedConfig = Copy-MenuConfig -Source $readyConfig
     $armedConfig['RemoveSourceAfterUpload'] = $true
     $armedMenu = Get-RenderedMenu -MenuConfig $armedConfig
     Assert-PubTest ($armedMenu -match 'ORIGINALS DELETED') 'arming source deletion is visible on the main menu at all times'
