@@ -1,0 +1,17 @@
+# Local configuration and run artefacts - never commit tenant data or key material
+SPO-PubConverter/config.json
+SPO-PubConverter/.certs/
+SPO-PubConverter/.secrets/
+
+SPO-PubConverter/working/*
+!SPO-PubConverter/working/.gitkeep
+
+SPO-PubConverter/logs/*
+!SPO-PubConverter/logs/.gitkeep
+
+*.pfx
+*.cer
+*.key
+*.pub
+*.pdf
+PublisherFileInventory_*.csv

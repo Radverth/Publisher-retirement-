@@ -1,0 +1,19 @@
+{
+  "TenantId": "00000000-0000-0000-0000-000000000000",
+  "TenantDomain": "contoso.onmicrosoft.com",
+  "AppId": "11111111-1111-1111-1111-111111111111",
+  "AppObjectId": "22222222-2222-2222-2222-222222222222",
+  "AppDisplayName": "SPO-Publisher-Converter-contoso",
+  "CertificateThumbprint": "A1B2C3D4E5F60718293A4B5C6D7E8F9012345678",
+  "CertificateExpiry": "2028-09-11",
+  "CertificatePublicPath": "C:\\SPO-PubConverter\\.certs\\SPO-PubConverter-11111111.cer",
+  "CertificatePfxPath": "",
+  "AuthMethod": "AllSites",
+  "DefaultWorkingFolder": "C:\\SPO-PubConverter\\working",
+  "LastInventoryCsv": "C:\\SPO-PubConverter\\working\\inventory\\PublisherFileInventory_2026-09-11_1030.csv",
+  "ExistingPdfAction": "Version",
+  "UploadConflictAction": "Version",
+  "RemoveSourceAfterUpload": false,
+  "ScopeSiteListPath": "",
+  "LastUpdated": "2026-09-11T10:30:00"
+}
