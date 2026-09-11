@@ -20,7 +20,7 @@
 
 Set-StrictMode -Version 2.0
 
-foreach ($dependency in @('Logging', 'Config', 'Graph')) {
+foreach ($dependency in @('Logging', 'Config', 'Graph', 'PnP')) {
     if (-not (Get-Module -Name $dependency)) {
         Import-Module (Join-Path $PSScriptRoot ("{0}.psm1" -f $dependency)) -Force -DisableNameChecking
     }
@@ -160,6 +160,45 @@ function Get-PubScopeUrl {
     return $urls.ToArray()
 }
 
+function Test-PubPnPEnumerationEnabled {
+    <#
+    .SYNOPSIS
+        True when discovery should use the SharePoint tenant admin site list.
+
+    .DESCRIPTION
+        Driven by the EnumerationMethod setting:
+          Auto  - use PnP when it is installed and the app can sign in to the
+                  admin site, otherwise fall back to Graph. (default)
+          PnP   - insist on PnP; a failure is reported rather than hidden.
+          Graph - never use PnP.
+    #>
+    [CmdletBinding()]
+    param($Config)
+
+    if (-not $Config) { $Config = Get-PubConfig }
+
+    $method = [string] $Config['EnumerationMethod']
+    if ([string]::IsNullOrWhiteSpace($method)) { $method = 'Auto' }
+
+    if ($method -eq 'Graph') { return $false }
+
+    if (-not (Test-PubPnPAvailable -Quiet)) {
+        if ($method -eq 'PnP') {
+            Write-PubLog -Level Warn -Message 'EnumerationMethod is PnP but PnP PowerShell is not usable on this host - falling back to Graph.'
+        }
+        return $false
+    }
+
+    if (-not (Connect-PubPnPAdmin -Config $Config)) {
+        if ($method -eq 'PnP') {
+            Write-PubLog -Level Warn -Message 'EnumerationMethod is PnP but the tenant admin connection failed - falling back to Graph.'
+        }
+        return $false
+    }
+
+    return $true
+}
+
 function Get-PubAllTenantSite {
     <#
     .SYNOPSIS
@@ -237,8 +276,11 @@ function Get-PubSiteList {
     param(
         [string]   $ScopePath,
         [string[]] $SiteUrl,
-        [switch]   $IncludePersonalSites
+        [switch]   $IncludePersonalSites,
+        $Config
     )
+
+    if (-not $Config) { $Config = Get-PubConfig }
 
     $sites = New-Object System.Collections.Generic.List[object]
     $seen  = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -255,10 +297,40 @@ function Get-PubSiteList {
         foreach ($url in (Get-PubScopeUrl -Path $ScopePath)) { $explicitUrls.Add($url) }
     }
 
-    if ($explicitUrls.Count -gt 0) {
-        Write-PubLog -Level Info -Message ('Resolving {0} scoped site URL(s)...' -f $explicitUrls.Count)
+    # The PnP tenant-admin route returns URLs rather than Graph site objects, so
+    # it feeds the same resolution path as an operator-supplied site list.
+    $enumerationRoute = ''
+    $routeComplete    = $false
 
-        foreach ($url in ($explicitUrls | Select-Object -Unique)) {
+    if ($explicitUrls.Count -eq 0 -and (Test-PubPnPEnumerationEnabled -Config $Config)) {
+        $pnpUrls = Get-PubPnPSiteUrl -IncludePersonalSites:$IncludePersonalSites -Config $Config
+        if (@($pnpUrls).Count -gt 0) {
+            foreach ($url in $pnpUrls) { $explicitUrls.Add($url) }
+            $enumerationRoute = 'SharePoint tenant admin (PnP)'
+            $routeComplete    = $true
+        } else {
+            Write-PubLog -Level Warn -Message 'The PnP tenant-admin route returned nothing - falling back to Graph enumeration.'
+        }
+    }
+
+    if ($explicitUrls.Count -gt 0) {
+        $unique = @($explicitUrls | Select-Object -Unique)
+        Write-PubLog -Level Info -Message ('Resolving {0} site URL(s) to Graph sites...' -f $unique.Count)
+
+        $resolved = 0
+        $failed   = 0
+
+        foreach ($url in $unique) {
+            $resolved++
+            if ($unique.Count -gt 25) {
+                Write-Progress -Activity 'Resolving sites' `
+                               -Status ('{0} of {1}' -f $resolved, $unique.Count) `
+                               -CurrentOperation $url `
+                               -PercentComplete ([int] (($resolved / $unique.Count) * 100))
+            }
+
+            if (-not $IncludePersonalSites -and $url -match '-my\.sharepoint\.com') { continue }
+
             try {
                 $parsed   = [uri] $url.TrimEnd('/')
                 $sitePath = $parsed.AbsolutePath.TrimEnd('/')
@@ -268,8 +340,18 @@ function Get-PubSiteList {
                 $site = Invoke-PubGraph -Uri ("{0}?`$select=id,webUrl,displayName,name" -f $graphUri) -Method GET
                 if ($site -and $seen.Add($site.id)) { $sites.Add($site) }
             } catch {
+                $failed++
                 Write-PubLog -Level Error -Message ('Could not resolve site {0}: {1}' -f $url, (Get-PubGraphErrorMessage -ErrorRecord $_))
             }
+        }
+
+        if ($unique.Count -gt 25) { Write-Progress -Activity 'Resolving sites' -Completed }
+
+        if ($enumerationRoute) {
+            Write-PubLog -Level Info -Message ('Enumeration route: {0} - {1} site(s) resolved, {2} unresolvable.' -f $enumerationRoute, $sites.Count, $failed)
+        }
+        if ($failed -gt 0) {
+            Write-PubLog -Level Warn -Message 'Unresolvable sites are usually locked, deleted-but-not-purged, or blocked by a Restricted Access Control policy. They are listed above and skipped.'
         }
     } else {
         Write-PubLog -Level Info -Message 'Enumerating every site the app registration can see...'
@@ -522,7 +604,7 @@ function Invoke-PubDiscovery {
     $started = Get-Date
     Write-PubLog -Level Info -Message '=== Phase 1: Discovery ==='
 
-    $sites = Get-PubSiteList -ScopePath $ScopePath -SiteUrl $SiteUrl -IncludePersonalSites:$IncludePersonalSites
+    $sites = Get-PubSiteList -ScopePath $ScopePath -SiteUrl $SiteUrl -IncludePersonalSites:$IncludePersonalSites -Config $Config
     if (-not $sites -or $sites.Count -eq 0) {
         Write-PubLog -Level Warn -Message 'No sites in scope - nothing to scan.'
         return @()
@@ -759,6 +841,7 @@ Export-ModuleMember -Function @(
     'Get-PubInventoryColumns'
     'New-PubInventoryRow'
     'Get-PubScopeUrl'
+    'Test-PubPnPEnumerationEnabled'
     'Get-PubAllTenantSite'
     'Get-PubSiteList'
     'Get-PubDocumentLibrary'

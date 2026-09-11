@@ -60,10 +60,10 @@ try {
         Assert-PubTest (-not $errors -or $errors.Count -eq 0) ('{0} parses' -f $file.Name)
     }
 
-    foreach ($module in @('Logging', 'Config', 'Graph', 'AppRegistration', 'Discovery', 'Convert', 'Upload')) {
+    foreach ($module in @('Logging', 'Config', 'Graph', 'AppRegistration', 'PnP', 'Discovery', 'Convert', 'Upload')) {
         Import-Module (Join-Path $moduleRoot ('{0}.psm1' -f $module)) -Force -DisableNameChecking
     }
-    Assert-PubTest $true 'all seven modules import'
+    Assert-PubTest $true 'all eight modules import'
 
     Initialize-PubLogging -Name 'Tests' -LogRoot (Join-Path $tempRoot 'logs') -NoTranscript | Out-Null
 
@@ -233,14 +233,59 @@ try {
     # -----------------------------------------------------------------------
     Write-PubTestSection 'Permission scopes and blast radius'
     # -----------------------------------------------------------------------
-    $allSites = Get-PubPermissionCatalog -AuthMethod 'AllSites'
-    $selected = Get-PubPermissionCatalog -AuthMethod 'SitesSelected'
+    $allSites    = Get-PubPermissionCatalog -AuthMethod 'AllSites'
+    $selected    = Get-PubPermissionCatalog -AuthMethod 'SitesSelected'
+    $tenantAdmin = Get-PubPermissionCatalog -AuthMethod 'TenantAdmin'
 
     Assert-PubTest ($null -ne ($allSites | Where-Object { $_.Name -eq 'Sites.ReadWrite.All' })) 'AllSites requests Sites.ReadWrite.All'
     Assert-PubTest ($null -ne ($allSites | Where-Object { $_.Name -eq 'Files.ReadWrite.All' })) 'AllSites requests Files.ReadWrite.All'
     Assert-PubTest ($null -eq ($allSites | Where-Object { $_.Name -eq 'Sites.Selected' }))      'AllSites does not mix in Sites.Selected'
     Assert-PubTest ($null -ne ($selected | Where-Object { $_.Name -eq 'Sites.Selected' }))      'SitesSelected requests Sites.Selected'
     Assert-PubTest ($null -eq ($selected | Where-Object { $_.Name -eq 'Files.ReadWrite.All' })) 'SitesSelected never requests tenant-wide write'
+
+    $fullControl = $tenantAdmin | Where-Object { $_.Name -eq 'Sites.FullControl.All' }
+    Assert-PubTest ($null -ne $fullControl) 'TenantAdmin requests SharePoint Sites.FullControl.All'
+    Assert-PubTest ($fullControl.Resource -eq 'SharePoint') 'FullControl is requested on the SharePoint API, not Graph'
+    Assert-PubTest ($null -eq ($allSites | Where-Object { $_.Name -eq 'Sites.FullControl.All' })) 'FullControl is never requested outside the TenantAdmin scope'
+    Assert-PubTest ($null -eq ($selected | Where-Object { $_.Name -eq 'Sites.FullControl.All' })) 'Sites.Selected stays free of FullControl'
+    Assert-PubTest ($null -ne ($tenantAdmin | Where-Object { $_.Name -eq 'Sites.ReadWrite.All' -and $_.Resource -eq 'Graph' })) 'TenantAdmin keeps the Graph permissions the pipeline needs'
+
+    Assert-PubTest ((Get-PubResourceAppId -Resource 'Graph') -eq '00000003-0000-0000-c000-000000000000')      'the Graph resource app id is correct'
+    Assert-PubTest ((Get-PubResourceAppId -Resource 'SharePoint') -eq '00000003-0000-0ff1-ce00-000000000000') 'the SharePoint resource app id is correct'
+
+    # App role ids are resolved live from the tenant; the catalogue GUID is only
+    # a fallback, and SharePoint has none at all, so the lookup must work.
+    $fakeServicePrincipal = [pscustomobject] @{ appRoles = @(
+        [pscustomobject] @{ value = 'Sites.FullControl.All'; id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
+    ) }
+    Assert-PubTest ((Resolve-PubAppRole -Permission $fullControl -ResourceServicePrincipal $fakeServicePrincipal) -eq 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee') 'app role ids resolve by permission name from the tenant'
+    $graphRead = $allSites | Where-Object { $_.Name -eq 'Sites.Read.All' }
+    Assert-PubTest ((Resolve-PubAppRole -Permission $graphRead -ResourceServicePrincipal $null) -eq $graphRead.Id) 'a failed lookup falls back to the catalogue id'
+    Assert-PubTest ($null -eq (Resolve-PubAppRole -Permission $fullControl -ResourceServicePrincipal $null)) 'SharePoint permissions report failure rather than inventing a GUID'
+
+    # -----------------------------------------------------------------------
+    Write-PubTestSection 'Enumeration method and tenant admin URL'
+    # -----------------------------------------------------------------------
+    $enumConfig = New-PubDefaultConfig
+    Assert-PubTest ($enumConfig['EnumerationMethod'] -eq 'Auto') 'enumeration defaults to Auto (PnP when available, else Graph)'
+
+    $enumConfig['EnumerationMethod'] = 'Graph'
+    Assert-PubTest ((Test-PubPnPEnumerationEnabled -Config $enumConfig) -eq $false) 'the Graph setting never uses PnP'
+
+    $enumConfig['EnumerationMethod'] = 'Auto'
+    Assert-PubTest ((Test-PubPnPEnumerationEnabled -Config $enumConfig) -eq $false) 'Auto falls back to Graph when PnP is unusable'
+
+    $adminConfig = New-PubDefaultConfig
+    $adminConfig['TenantDomain'] = 'contoso.onmicrosoft.com'
+    Assert-PubTest ((Get-PubTenantAdminUrl -Config $adminConfig) -eq 'https://contoso-admin.sharepoint.com') 'the admin URL is derived from an onmicrosoft.com domain'
+
+    $adminConfig['TenantDomain'] = 'contoso.sharepoint.com'
+    Assert-PubTest ((Get-PubTenantAdminUrl -Config $adminConfig) -eq 'https://contoso-admin.sharepoint.com') 'the admin URL is derived from a sharepoint.com domain'
+
+    $adminConfig['SharePointAdminUrl'] = 'https://override-admin.sharepoint.com/'
+    Assert-PubTest ((Get-PubTenantAdminUrl -Config $adminConfig) -eq 'https://override-admin.sharepoint.com') 'an explicit SharePointAdminUrl wins and is trimmed'
+
+    Assert-PubTest ((Test-PubPnPAvailable -Quiet) -eq $false) 'the PnP probe fails closed when the module is absent'
 
     # -----------------------------------------------------------------------
     Write-PubTestSection 'Conversion prerequisites fail closed'

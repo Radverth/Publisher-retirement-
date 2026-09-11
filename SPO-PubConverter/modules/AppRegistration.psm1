@@ -54,7 +54,8 @@ foreach ($dependency in @('Logging', 'Config', 'Graph')) {
     }
 }
 
-$script:GraphAppId = '00000003-0000-0000-c000-000000000000'
+$script:GraphAppId      = '00000003-0000-0000-c000-000000000000'
+$script:SharePointAppId = '00000003-0000-0ff1-ce00-000000000000'
 
 function Get-PubPermissionCatalog {
     <#
@@ -67,35 +68,89 @@ function Get-PubPermissionCatalog {
     #>
     [CmdletBinding()]
     param(
-        [ValidateSet('AllSites', 'SitesSelected')]
+        [ValidateSet('AllSites', 'SitesSelected', 'TenantAdmin')]
         [string] $AuthMethod = 'AllSites'
     )
 
     $all = @(
-        [pscustomobject] @{ Name = 'Sites.Read.All';      Id = '332a536c-c7ef-4017-ab91-336970924f0d'; Purpose = 'Enumerate site collections and crawl document libraries during discovery'; Methods = @('AllSites') }
-        [pscustomobject] @{ Name = 'Sites.ReadWrite.All'; Id = '9492366f-7969-46a4-8d15-ed1a20078fff'; Purpose = 'Upload converted PDFs back to the source library';                        Methods = @('AllSites') }
-        [pscustomobject] @{ Name = 'Files.ReadWrite.All'; Id = '75359482-378d-4052-8f01-80520e7db3cd'; Purpose = 'Download source .pub files and write PDFs via Graph drive items';         Methods = @('AllSites') }
-        [pscustomobject] @{ Name = 'Sites.Selected';      Id = '883ea226-0bf2-4a8f-9f9d-92c9162a727d'; Purpose = 'Access only the sites an administrator explicitly grants (tight scope)';  Methods = @('SitesSelected') }
-        [pscustomobject] @{ Name = 'Directory.Read.All';  Id = '7ab1d382-f21e-4acd-a863-ba3e13f7da61'; Purpose = 'Resolve site/user metadata where needed (optional)';                      Methods = @('AllSites', 'SitesSelected') }
+        [pscustomobject] @{ Name = 'Sites.Read.All';      Resource = 'Graph';      Id = '332a536c-c7ef-4017-ab91-336970924f0d'; Purpose = 'Enumerate site collections and crawl document libraries during discovery'; Methods = @('AllSites', 'TenantAdmin') }
+        [pscustomobject] @{ Name = 'Sites.ReadWrite.All'; Resource = 'Graph';      Id = '9492366f-7969-46a4-8d15-ed1a20078fff'; Purpose = 'Upload converted PDFs back to the source library';                        Methods = @('AllSites', 'TenantAdmin') }
+        [pscustomobject] @{ Name = 'Files.ReadWrite.All'; Resource = 'Graph';      Id = '75359482-378d-4052-8f01-80520e7db3cd'; Purpose = 'Download source .pub files and write PDFs via Graph drive items';         Methods = @('AllSites', 'TenantAdmin') }
+        [pscustomobject] @{ Name = 'Sites.Selected';      Resource = 'Graph';      Id = '883ea226-0bf2-4a8f-9f9d-92c9162a727d'; Purpose = 'Access only the sites an administrator explicitly grants (tight scope)';  Methods = @('SitesSelected') }
+        [pscustomobject] @{ Name = 'Directory.Read.All';  Resource = 'Graph';      Id = '7ab1d382-f21e-4acd-a863-ba3e13f7da61'; Purpose = 'Resolve site/user metadata where needed (optional)';                      Methods = @('AllSites', 'SitesSelected', 'TenantAdmin') }
+        [pscustomobject] @{ Name = 'Sites.FullControl.All'; Resource = 'SharePoint'; Id = ''; Purpose = 'Read the SharePoint tenant admin site list, so discovery finds every site without a manual export'; Methods = @('TenantAdmin') }
     )
 
     return $all | Where-Object { $_.Methods -contains $AuthMethod }
 }
 
+function Get-PubResourceAppId {
+    <#
+    .SYNOPSIS
+        Maps a catalogue Resource name to its well-known application id.
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Graph', 'SharePoint')]
+        [string] $Resource = 'Graph'
+    )
+
+    if ($Resource -eq 'SharePoint') { return $script:SharePointAppId }
+    return $script:GraphAppId
+}
+
+function Resolve-PubAppRole {
+    <#
+    .SYNOPSIS
+        Finds a permission's app role id on the resource service principal.
+
+    .DESCRIPTION
+        Resolved live from the tenant by permission name rather than trusting a
+        hardcoded GUID. The catalogue's Id is only a fallback for when the
+        lookup cannot run - and the SharePoint permissions have no hardcoded id
+        at all, so they must come from here.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Permission,
+        $ResourceServicePrincipal
+    )
+
+    if ($ResourceServicePrincipal -and $ResourceServicePrincipal.PSObject.Properties['appRoles']) {
+        foreach ($role in $ResourceServicePrincipal.appRoles) {
+            if ($role.value -eq $Permission.Name) { return $role.id }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Permission.Id)) { return $Permission.Id }
+
+    Write-PubLog -Level Warn -Message ('Could not resolve the app role id for {0} on the {1} API.' -f $Permission.Name, $Permission.Resource)
+    return $null
+}
+
 function Show-PubPermissionTable {
     [CmdletBinding()]
     param(
-        [ValidateSet('AllSites', 'SitesSelected')]
+        [ValidateSet('AllSites', 'SitesSelected', 'TenantAdmin')]
         [string] $AuthMethod = 'AllSites'
     )
 
     Write-Host ''
     Write-Host 'Microsoft Graph application permissions to be requested:' -ForegroundColor Cyan
     Get-PubPermissionCatalog -AuthMethod $AuthMethod |
-        Format-Table @{ N = 'Permission'; E = { $_.Name } }, @{ N = 'Type'; E = { 'Application' } }, @{ N = 'Purpose'; E = { $_.Purpose } } -AutoSize |
+        Format-Table @{ N = 'Permission'; E = { $_.Name } }, @{ N = 'API'; E = { $_.Resource } }, @{ N = 'Type'; E = { 'Application' } }, @{ N = 'Purpose'; E = { $_.Purpose } } -AutoSize |
         Out-String | Write-Host
 
-    if ($AuthMethod -eq 'AllSites') {
+    if ($AuthMethod -eq 'TenantAdmin') {
+        Write-Host 'WARNING: this scope includes SharePoint Sites.FullControl.All - full administrative' -ForegroundColor Red
+        Write-Host '         control of every site collection in the tenant, above and beyond the' -ForegroundColor Red
+        Write-Host '         tenant-wide read/write below. It is what lets discovery read the tenant' -ForegroundColor Red
+        Write-Host '         admin site list, so no manual site export is needed. Delete the app' -ForegroundColor Red
+        Write-Host '         registration when the Publisher retirement is finished.' -ForegroundColor Red
+        Write-Host ''
+    }
+
+    if ($AuthMethod -eq 'AllSites' -or $AuthMethod -eq 'TenantAdmin') {
         Write-Host 'WARNING: Sites.ReadWrite.All and Files.ReadWrite.All are TENANT-WIDE write permissions.' -ForegroundColor Yellow
         Write-Host '         Every SharePoint site and OneDrive in the tenant becomes readable and writable' -ForegroundColor Yellow
         Write-Host '         by anything holding this app''s certificate. Choose Sites.Selected instead if you' -ForegroundColor Yellow
@@ -164,26 +219,36 @@ function New-PubAppRegistration {
     param(
         [Parameter(Mandatory)] [string] $DisplayName,
 
-        [ValidateSet('AllSites', 'SitesSelected')]
+        [ValidateSet('AllSites', 'SitesSelected', 'TenantAdmin')]
         [string] $AuthMethod = 'AllSites'
     )
 
-    $permissions      = Get-PubPermissionCatalog -AuthMethod $AuthMethod
-    $resourceAccess   = @()
-    foreach ($permission in $permissions) {
-        $resourceAccess += @{ id = $permission.Id; type = 'Role' }
+    $permissions            = Get-PubPermissionCatalog -AuthMethod $AuthMethod
+    $requiredResourceAccess = @()
+
+    foreach ($resourceName in @('Graph', 'SharePoint')) {
+        $forResource = @($permissions | Where-Object { $_.Resource -eq $resourceName })
+        if ($forResource.Count -eq 0) { continue }
+
+        $resourceAppId           = Get-PubResourceAppId -Resource $resourceName
+        $resourceServicePrincipal = Get-PubServicePrincipal -AppId $resourceAppId
+        $resourceAccess          = @()
+
+        foreach ($permission in $forResource) {
+            $roleId = Resolve-PubAppRole -Permission $permission -ResourceServicePrincipal $resourceServicePrincipal
+            if ($roleId) { $resourceAccess += @{ id = $roleId; type = 'Role' } }
+        }
+
+        if ($resourceAccess.Count -gt 0) {
+            $requiredResourceAccess += @{ resourceAppId = $resourceAppId; resourceAccess = $resourceAccess }
+        }
     }
 
     $body = @{
         displayName            = $DisplayName
         signInAudience         = 'AzureADMyOrg'
         description            = 'Created by the SharePoint Publisher File Converter to find and convert .pub files.'
-        requiredResourceAccess = @(
-            @{
-                resourceAppId  = $script:GraphAppId
-                resourceAccess = $resourceAccess
-            }
-        )
+        requiredResourceAccess = $requiredResourceAccess
     }
 
     try {
@@ -248,7 +313,7 @@ function Grant-PubAdminConsent {
         [Parameter(Mandatory)] [string] $AppId,
         [string] $ServicePrincipalId,
 
-        [ValidateSet('AllSites', 'SitesSelected')]
+        [ValidateSet('AllSites', 'SitesSelected', 'TenantAdmin')]
         [string] $AuthMethod = 'AllSites',
 
         [Parameter(Mandatory)] [string] $TenantId
@@ -259,9 +324,8 @@ function Grant-PubAdminConsent {
         if ($servicePrincipal) { $ServicePrincipalId = $servicePrincipal.id }
     }
 
-    $graphServicePrincipal = Get-PubServicePrincipal -AppId $script:GraphAppId
-    if (-not $ServicePrincipalId -or -not $graphServicePrincipal) {
-        Write-PubLog -Level Warn -Message 'Could not resolve the service principals needed to grant consent automatically.'
+    if (-not $ServicePrincipalId) {
+        Write-PubLog -Level Warn -Message 'Could not resolve the service principal needed to grant consent automatically.'
         Show-PubConsentUrl -AppId $AppId -TenantId $TenantId
         return $false
     }
@@ -270,25 +334,40 @@ function Grant-PubAdminConsent {
     $granted     = 0
     $failed      = 0
 
-    foreach ($permission in $permissions) {
-        $body = @{
-            principalId = $ServicePrincipalId
-            resourceId  = $graphServicePrincipal.id
-            appRoleId   = $permission.Id
+    foreach ($resourceName in @('Graph', 'SharePoint')) {
+        $forResource = @($permissions | Where-Object { $_.Resource -eq $resourceName })
+        if ($forResource.Count -eq 0) { continue }
+
+        $resourceServicePrincipal = Get-PubServicePrincipal -AppId (Get-PubResourceAppId -Resource $resourceName)
+        if (-not $resourceServicePrincipal) {
+            Write-PubLog -Level Warn -Message ('The {0} service principal is not present in this tenant - its permissions cannot be granted from here.' -f $resourceName)
+            $failed += $forResource.Count
+            continue
         }
 
-        try {
-            Invoke-PubGraph -Uri ("servicePrincipals/{0}/appRoleAssignedTo" -f $graphServicePrincipal.id) -Method POST -Body $body -ContentType 'application/json' | Out-Null
-            Write-PubLog -Level Success -Message ('Granted {0}.' -f $permission.Name)
-            $granted++
-        } catch {
-            $message = Get-PubGraphErrorMessage -ErrorRecord $_
-            if ($message -match 'Permission being assigned already exists') {
-                Write-PubLog -Level Info -Message ('{0} was already granted.' -f $permission.Name)
+        foreach ($permission in $forResource) {
+            $roleId = Resolve-PubAppRole -Permission $permission -ResourceServicePrincipal $resourceServicePrincipal
+            if (-not $roleId) { $failed++; continue }
+
+            $body = @{
+                principalId = $ServicePrincipalId
+                resourceId  = $resourceServicePrincipal.id
+                appRoleId   = $roleId
+            }
+
+            try {
+                Invoke-PubGraph -Uri ("servicePrincipals/{0}/appRoleAssignedTo" -f $resourceServicePrincipal.id) -Method POST -Body $body -ContentType 'application/json' | Out-Null
+                Write-PubLog -Level Success -Message ('Granted {0} ({1}).' -f $permission.Name, $resourceName)
                 $granted++
-            } else {
-                Write-PubLog -Level Warn -Message ('Could not grant {0}: {1}' -f $permission.Name, $message)
-                $failed++
+            } catch {
+                $message = Get-PubGraphErrorMessage -ErrorRecord $_
+                if ($message -match 'Permission being assigned already exists') {
+                    Write-PubLog -Level Info -Message ('{0} ({1}) was already granted.' -f $permission.Name, $resourceName)
+                    $granted++
+                } else {
+                    Write-PubLog -Level Warn -Message ('Could not grant {0} ({1}): {2}' -f $permission.Name, $resourceName, $message)
+                    $failed++
+                }
             }
         }
     }
@@ -339,7 +418,7 @@ function Test-PubAdminConsent {
     param(
         [Parameter(Mandatory)] [string] $AppId,
 
-        [ValidateSet('AllSites', 'SitesSelected')]
+        [ValidateSet('AllSites', 'SitesSelected', 'TenantAdmin')]
         [string] $AuthMethod = 'AllSites'
     )
 
@@ -359,9 +438,15 @@ function Test-PubAdminConsent {
     $assignedIds = @()
     foreach ($assignment in $assignments) { $assignedIds += $assignment.appRoleId }
 
+    $resourceServicePrincipals = @{}
+    foreach ($resourceName in @('Graph', 'SharePoint')) {
+        $resourceServicePrincipals[$resourceName] = Get-PubServicePrincipal -AppId (Get-PubResourceAppId -Resource $resourceName)
+    }
+
     $missing = @()
     foreach ($permission in (Get-PubPermissionCatalog -AuthMethod $AuthMethod)) {
-        if ($assignedIds -notcontains $permission.Id) { $missing += $permission.Name }
+        $roleId = Resolve-PubAppRole -Permission $permission -ResourceServicePrincipal $resourceServicePrincipals[$permission.Resource]
+        if (-not $roleId -or $assignedIds -notcontains $roleId) { $missing += ('{0} ({1})' -f $permission.Name, $permission.Resource) }
     }
 
     if ($missing.Count -gt 0) {
@@ -658,6 +743,8 @@ function Get-PubAppRegistrationStatus {
 
 Export-ModuleMember -Function @(
     'Get-PubPermissionCatalog'
+    'Get-PubResourceAppId'
+    'Resolve-PubAppRole'
     'Show-PubPermissionTable'
     'Get-PubApplication'
     'Get-PubServicePrincipal'

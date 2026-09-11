@@ -73,7 +73,9 @@ function New-PubDefaultConfig {
         CertificateExpiry       = ''
         CertificatePublicPath   = ''
         CertificatePfxPath      = ''
-        AuthMethod              = 'AllSites'          # AllSites | SitesSelected
+        AuthMethod              = 'AllSites'          # AllSites | SitesSelected | TenantAdmin
+        EnumerationMethod       = 'Auto'              # Auto | PnP | Graph
+        SharePointAdminUrl      = ''                  # override; derived from the tenant domain when blank
         DefaultWorkingFolder    = (Join-Path $script:ProjectRoot 'working')
         LastInventoryCsv        = ''
         ExistingPdfAction       = 'Version'           # Skip | Overwrite | Version

@@ -37,7 +37,7 @@ Then, first time through:
 
 | Step | Menu option | What happens |
 |------|-------------|--------------|
-| 1 | `1` → *Create a new app registration* | Interactive admin sign-in, app + service principal created, permissions consented |
+| 1 | `1` → *Create a new app registration* | Interactive admin sign-in, app + service principal created, permissions consented. With PnP installed, the one-step path does the certificate and consent here too — skip step 2 |
 | 2 | `2` | Self-signed certificate created and its public key uploaded to the app |
 | 3 | `3` | App-only sign-in tested against Graph **and** SharePoint |
 | 4 | `4` | Tenant (or scoped) crawl for `.pub` files, CSV written automatically |
@@ -54,6 +54,7 @@ menu level; anything unrecognised simply re-prompts.
 |-------------|-----------|-------|
 | Windows PowerShell 5.1 **or** PowerShell 7 | the menu and all Graph work | The menu itself runs on either |
 | `Microsoft.Graph.Authentication` | everything | Every call goes through `Invoke-MgGraphRequest`; the tool tells you how to install it if it is missing |
+| `PnP.PowerShell` (PowerShell 7.4.6+) | one-step setup and complete site enumeration | Optional but recommended — `Install-Module PnP.PowerShell -Scope CurrentUser` |
 | **Windows host with Microsoft Publisher installed** | the conversion step only | Hard prerequisite, checked at startup and before any conversion |
 | Global Administrator / Application Administrator | setup options 1, 2 and the Sites.Selected grant | Only for setup — day-to-day runs use the certificate |
 | OpenSSL | certificate generation on non-Windows hosts | Fallback path only |
@@ -90,26 +91,47 @@ sent in batches of 25; each file's result is appended to a JSONL file as it
 finishes, so even a killed batch reports everything that completed, and the
 file that hung is marked `Failed` with a reason.
 
-## Microsoft Graph SDK, not PnP PowerShell
+## Graph for the pipeline, PnP for what Graph cannot automate
 
 The brief asked for one approach with the trade-off documented. This build uses
-a **bespoke single-tenant app registration driven by the Microsoft Graph
-PowerShell SDK** for everything.
+a **bespoke single-tenant app registration** — one principal the customer owns,
+named for this tool, revocable on its own — and drives it two ways:
 
-**For:** one principal the customer owns, named for this tool, revocable on its
-own; explicit, auditable permissions that can be narrowed to `Sites.Selected`;
-no dependency on the Microsoft-operated PnP Management Shell multi-tenant app
-that other tooling in the tenant may also rely on — revoking that would break
-those too.
+| Work | Library | Why |
+|------|---------|-----|
+| Crawl, download, upload | Microsoft Graph SDK | Drive-item APIs are first-class in Graph, and it needs only `Microsoft.Graph.Authentication` |
+| Tenant site enumeration | **PnP PowerShell** | `Get-PnPTenantSite` reads the SharePoint tenant admin list — the only complete one |
+| App registration setup | **PnP PowerShell** (optional) | `Register-PnPEntraIDApp` does app + certificate + consent in one step |
 
-**Against:** a little more setup code than
-`Register-PnPManagementShellAccess`, and no access to CSOM-only SharePoint
-features. Nothing this tool does (enumerate sites, read and write drive items)
-needs CSOM.
+An earlier draft of this README justified avoiding PnP on the grounds that it
+would mean depending on the shared PnP Management Shell multi-tenant app. That
+was wrong: PnP connects perfectly well with your own app registration and
+certificate (`Connect-PnPOnline -ClientId <your app> -Tenant <x> -Thumbprint <y>`),
+which is exactly what this tool does. No Management Shell app is registered or
+used.
+
+PnP stays **optional**. Where it is absent the tool runs end to end on Graph
+alone, with the enumeration caveats below. What PnP genuinely costs:
+
+- Current PnP needs **PowerShell 7.4.6+**; Windows PowerShell 5.1 is only
+  supported by PnP 1.12.0, which is unmaintained. The menu still runs under
+  5.1 without PnP, and the COM conversion step always runs under 5.1 either
+  way.
+- The tenant admin site list requires **SharePoint `Sites.FullControl.All`** —
+  see below.
 
 ## Permissions and blast radius
 
-Default (`AllSites`) mode requests these **application** permissions:
+Setup offers three scopes. All permissions are **application** permissions —
+there is no user context at run time.
+
+| Scope | Permissions | Site discovery |
+|-------|-------------|----------------|
+| **`TenantAdmin`** (default) | the `AllSites` set **plus** SharePoint `Sites.FullControl.All` | Fully automatic and complete — reads the tenant admin site list |
+| `AllSites` | `Sites.Read.All`, `Sites.ReadWrite.All`, `Files.ReadWrite.All`, `Directory.Read.All` (Graph) | Falls back to the search index, which can miss sites |
+| `SitesSelected` | `Sites.Selected`, `Directory.Read.All` (Graph) | Only the sites explicitly granted to the app |
+
+What each Graph permission is for:
 
 | Permission | Purpose |
 |------------|---------|
@@ -117,6 +139,18 @@ Default (`AllSites`) mode requests these **application** permissions:
 | `Sites.ReadWrite.All` | Upload converted PDFs back to the source library |
 | `Files.ReadWrite.All` | Download source `.pub` files and write PDFs via drive items |
 | `Directory.Read.All` | Resolve site/user metadata (optional) |
+
+> **`Sites.FullControl.All` (SharePoint API) is the largest grant here** — full
+> administrative control of every site collection in the tenant, beyond the
+> tenant-wide read/write below. It is what makes site discovery complete and
+> automatic, and it is required for that: `Sites.Read.All` is explicitly not
+> enough to list tenant sites, and `Sites.Manage.All` is the documented floor.
+> It cannot be combined with `Sites.Selected`. Choose it deliberately, and
+> delete the app registration when the retirement project is finished.
+
+App role IDs are resolved live from each resource service principal by
+permission name rather than from hardcoded GUIDs, so consent does not silently
+grant the wrong role if Microsoft ever changes one.
 
 > **`Sites.ReadWrite.All` and `Files.ReadWrite.All` are tenant-wide write
 > permissions.** They grant read and write to every SharePoint site and every
@@ -149,18 +183,25 @@ question is whether the tool can *list* a site in order to go there. Three
 routes are tried, best first, and the one actually used is logged with the site
 count:
 
-| Route | Source | Complete? |
-|-------|--------|-----------|
-| `v1.0 /sites/getAllSites` | tenant store | yes — not yet available in every tenant |
-| `beta /sites/getAllSites` | tenant store | yes |
-| `v1.0 /sites?search=*` | **search index** | no — see below |
+| Route | Source | Complete? | Needs |
+|-------|--------|-----------|-------|
+| **`Get-PnPTenantSite`** | SharePoint tenant admin | **yes** | PnP + `TenantAdmin` scope |
+| `v1.0 /sites/getAllSites` | tenant store | yes — not available in every tenant | Graph |
+| `beta /sites/getAllSites` | tenant store | yes | Graph |
+| `v1.0 /sites?search=*` | **search index** | no — see below | Graph |
+
+With the `TenantAdmin` scope and PnP installed, the first route is used and
+nothing is missed — no manual export, no search-index gaps. The PnP route
+returns URLs, which are then resolved to Graph sites and crawled by the same
+code path as a hand-supplied site list.
 
 If it falls through to site search, the scan prints a warning, because that
 route can miss sites excluded from search indexing, sites created too recently
 to be indexed, and Teams private-channel sites (which are separate site
 collections).
 
-**The guaranteed-complete route:** SharePoint admin centre → Active sites →
+**If you are not using the PnP route**, the guaranteed-complete fallback is
+manual: SharePoint admin centre → Active sites →
 **Export to CSV**, then menu `4` → *read the URLs from a text or CSV file*. That
 list comes from the SharePoint tenant store rather than the search index, so
 nothing is missing. The export loads unedited — its column is `URL`, and the
@@ -225,7 +266,9 @@ uploaded back.
 
 ## Existing files: skip, overwrite or version
 
-Menu option `13` sets both rules; neither is hardcoded.
+Menu option `13` sets both rules — plus the working folder and the site
+enumeration method (`Auto` / `PnP` / `Graph`). Neither collision rule is
+hardcoded.
 
 | Setting | Applies to | `Skip` | `Overwrite` | `Version` (default) |
 |---------|-----------|--------|-------------|---------------------|
@@ -289,15 +332,19 @@ SPO-PubConverter/
     Logging.psm1              shared transcript/log helper
     Config.psm1               config.json + secret handling      (addition)
     Graph.psm1                Graph connect + throttling retry   (addition)
+    PnP.psm1                  optional PnP: setup + enumeration  (addition)
   tests/Run-Tests.ps1         offline checks, no tenant needed   (addition)
   working/                    downloaded originals, /converted, /inventory
   logs/
 ```
 
-`Config.psm1` and `Graph.psm1` are additions to the module layout in the brief:
+`Config.psm1`, `Graph.psm1` and `PnP.psm1` are additions to the module layout in
+the brief:
 config handling and the throttling-aware request wrapper are used by every
 phase, and putting them in one place each is what stops the retry logic being
-copy-pasted five times. `Discovery.psm1` owns the CSV schema, so `Convert.psm1`
+copy-pasted five times. `PnP.psm1` keeps every PnP dependency behind one
+boundary, so the tool still runs with PnP absent. `Discovery.psm1` owns the CSV
+schema, so `Convert.psm1`
 and `Upload.psm1` import it rather than defining the format again.
 
 ## Tests
@@ -306,12 +353,13 @@ and `Upload.psm1` import it rather than defining the format again.
 .\tests\Run-Tests.ps1
 ```
 
-85 offline checks: every file parses and every module imports, the CSV schema
+103 offline checks: every file parses and every module imports, the CSV schema
 matches the brief exactly, local paths mirror SharePoint without collisions,
 filters and status counts behave, config round-trips without persisting
 secrets, certificate expiry warns at the right thresholds, the
 skip/overwrite/version rule does what it says, scope files load (including the
-SharePoint admin centre export unedited), and the preserved parts of Tom's
+SharePoint admin centre export unedited), the permission scopes stay separated
+and app role ids resolve live, and the preserved parts of Tom's
 conversion script (the Interop enum, the COM pattern, `app.Quit()` in
 `finally`) are still there. Nothing touches a tenant, so it is safe to run any
 time — including on the Linux/macOS host you might be editing from.
@@ -339,6 +387,8 @@ time — including on the Linux/macOS host you might be editing from.
 | Everything `Failed` with `HTTP 403` | The app has no access to that site. In `Sites.Selected` mode each site needs its own grant. |
 | Conversion says Publisher is not available | Run the conversion phase on the Windows host with Publisher, per *Where each phase can run*. |
 | A batch stalls then every file in it fails | One file hung Publisher. The batch timed out and was killed; re-run option `8` and it resumes from the files with no result. Check Task Manager for a stray `MSPUB.EXE`. |
+| PnP admin sign-in fails with 403 | The app lacks SharePoint `Sites.FullControl.All`, or the grant has not replicated yet (it can take several minutes). Re-test with option `3`. |
+| Setup offers no one-step path | PnP is not installed, or the host is on PowerShell 5.1. Both are fine — the Graph step-by-step path does the same job. |
 | Scan found fewer sites than expected | It fell through to the search-index route — the log says which route was used. Re-run scoped to the admin centre's Active sites export. |
 | A known site is missing from the CSV | Same cause, or the site is blocked by a Restricted Access Control / application access policy (logged per site). |
 | Crawl is slow on a large tenant | Expected — it is per-site, per-library, per-folder. Scope the first run to a couple of sites using option `4` → *Specific sites*. |

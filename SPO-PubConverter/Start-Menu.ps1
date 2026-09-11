@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:ModuleFolder = Join-Path $PSScriptRoot 'modules'
 
-foreach ($module in @('Logging', 'Config', 'Graph', 'AppRegistration', 'Discovery', 'Convert', 'Upload')) {
+foreach ($module in @('Logging', 'Config', 'Graph', 'AppRegistration', 'PnP', 'Discovery', 'Convert', 'Upload')) {
     Import-Module (Join-Path $script:ModuleFolder ("{0}.psm1" -f $module)) -Force -DisableNameChecking
 }
 
@@ -235,17 +235,23 @@ function Invoke-PubCreateAppRegistration {
 
     Write-Host ''
     Write-Host '  How much access should this app have?' -ForegroundColor Cyan
-    Write-Host '   1) Tenant-wide (Sites.Read.All + Sites.ReadWrite.All + Files.ReadWrite.All)'
-    Write-Host '      Simplest to run. Grants read AND WRITE to every site in the tenant.'
-    Write-Host '   2) Selected sites only (Sites.Selected) - recommended for a scoped project'
+    Write-Host '   1) Tenant-wide + SharePoint admin - FULLY AUTOMATIC site discovery'
+    Write-Host '      Adds SharePoint Sites.FullControl.All so discovery can read the tenant'
+    Write-Host '      admin site list. Finds every site with no manual export. Largest grant:'
+    Write-Host '      full administrative control of every site collection.'
+    Write-Host '   2) Tenant-wide (Sites.Read.All + Sites.ReadWrite.All + Files.ReadWrite.All)'
+    Write-Host '      Read AND WRITE to every site. Site discovery falls back to the search'
+    Write-Host '      index, which can miss sites - see the README.'
+    Write-Host '   3) Selected sites only (Sites.Selected) - tightest scope'
     Write-Host '      No access until an administrator grants each site (option 4 in this menu).'
     Write-Host '   0) Cancel'
     Write-Host ''
 
-    $authMethod = 'AllSites'
-    switch (Read-PubMenuChoice -Valid @('0', '1', '2')) {
-        '1' { $authMethod = 'AllSites' }
-        '2' { $authMethod = 'SitesSelected' }
+    $authMethod = 'TenantAdmin'
+    switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3')) {
+        '1' { $authMethod = 'TenantAdmin' }
+        '2' { $authMethod = 'AllSites' }
+        '3' { $authMethod = 'SitesSelected' }
         '0' { Write-PubLog -Level Info -Message 'Cancelled.'; return }
     }
 
@@ -254,6 +260,25 @@ function Invoke-PubCreateAppRegistration {
     if (-not (Confirm-PubAction -Question 'Create the app registration with these permissions?')) {
         Write-PubLog -Level Warn -Message 'Cancelled - nothing was created.'
         return
+    }
+
+    # One-step path: PnP creates the app, the certificate and the consent flow
+    # together, so options 1 and 2 collapse into a single action.
+    if (Test-PubPnPAvailable -Quiet) {
+        Write-Host ''
+        Write-Host '  PnP PowerShell is available on this host.' -ForegroundColor Cyan
+        Write-Host '   1) One-step setup with PnP (app + certificate + consent together)'
+        Write-Host '   2) Step-by-step with Graph (app now, certificate at option 2)'
+        Write-Host '   0) Cancel'
+        Write-Host ''
+
+        switch (Read-PubMenuChoice -Valid @('0', '1', '2')) {
+            '1' { Invoke-PubPnPRegistration -Tenant $tenant -AuthMethod $authMethod; return }
+            '2' { }
+            '0' { Write-PubLog -Level Info -Message 'Cancelled.'; return }
+        }
+    } elseif ($authMethod -eq 'TenantAdmin') {
+        Write-PubLog -Level Info -Message 'PnP PowerShell is not installed - the app will still be granted the SharePoint permission, but install PnP to use it: Install-Module PnP.PowerShell -Scope CurrentUser'
     }
 
     if (-not (Connect-PubGraphInteractive -TenantId $tenant)) { return }
@@ -302,6 +327,82 @@ function Invoke-PubCreateAppRegistration {
 
     Write-Host ''
     Write-PubLog -Level Success -Message 'App registration step complete. Next: option 2 to generate the authentication certificate.'
+}
+
+function Invoke-PubPnPRegistration {
+    <#
+    .SYNOPSIS
+        One-step app registration through PnP, then records it in config.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Tenant,
+
+        [ValidateSet('AllSites', 'SitesSelected', 'TenantAdmin')]
+        [string] $AuthMethod = 'TenantAdmin'
+    )
+
+    $shortName   = ($Tenant -split '\.')[0]
+    $defaultName = 'SPO-Publisher-Converter-{0}' -f $shortName
+
+    $displayName = Read-Host ('App registration name [{0}]' -f $defaultName)
+    if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $defaultName }
+
+    $years  = 2
+    $answer = Read-Host ('Certificate validity in years [{0}]' -f $years)
+    if (-not [string]::IsNullOrWhiteSpace($answer)) {
+        $parsed = 0
+        if ([int]::TryParse($answer, [ref] $parsed) -and $parsed -ge 1 -and $parsed -le 5) { $years = $parsed }
+        else { Write-PubLog -Level Warn -Message ('"{0}" is not 1-5 years - using {1}.' -f $answer, $years) }
+    }
+
+    $registration = Register-PubPnPApplication -DisplayName $displayName -Tenant $Tenant -AuthMethod $AuthMethod -ValidYears $years
+    if (-not $registration) {
+        Write-PubLog -Level Error -Message 'PnP registration did not complete. Try the step-by-step Graph path instead.'
+        return
+    }
+
+    $script:Config['TenantId']              = $Tenant
+    $script:Config['TenantDomain']          = $Tenant
+    $script:Config['AppId']                 = $registration.AppId
+    $script:Config['AppDisplayName']        = $displayName
+    $script:Config['AuthMethod']            = $AuthMethod
+    $script:Config['CertificateThumbprint'] = [string] $registration.Thumbprint
+    $script:Config['CertificatePublicPath'] = [string] $registration.CerPath
+    $script:Config['CertificatePfxPath']    = [string] $registration.PfxPath
+
+    if ($registration.NotAfter) {
+        $script:Config['CertificateExpiry'] = $registration.NotAfter.ToString('yyyy-MM-dd')
+    }
+
+    Save-PubConfig -Config $script:Config | Out-Null
+
+    # The tenant id recorded above is the domain PnP was given; resolve the
+    # real GUID now that we can sign in, so later runs connect cleanly.
+    Write-Host ''
+    Write-PubLog -Level Info -Message 'Consent and certificate publication can take a minute. Testing the connection...'
+    Start-Sleep -Seconds 10
+
+    if (Connect-PubGraphApp -Config $script:Config -Force) {
+        $context = Get-PubGraphContext
+        if ($context -and $context.TenantId) {
+            $script:Config['TenantId'] = $context.TenantId
+            Save-PubConfig -Config $script:Config | Out-Null
+        }
+        Write-PubLog -Level Success -Message 'Setup complete - options 1 and 2 are both done. Run option 3 to confirm SharePoint access.'
+    } else {
+        Write-PubLog -Level Warn -Message 'The app is registered but app-only sign-in did not work yet. Wait a minute and run option 3.'
+    }
+
+    if ($AuthMethod -eq 'TenantAdmin') {
+        Write-Host ''
+        Write-PubLog -Level Info -Message 'Checking the SharePoint tenant admin site list...'
+        if (Connect-PubPnPAdmin -Config $script:Config -Force) {
+            Write-PubLog -Level Success -Message 'Tenant admin enumeration is working - discovery will find every site automatically.'
+        } else {
+            Write-PubLog -Level Warn -Message 'Tenant admin enumeration is not working yet. SharePoint permission changes can take several minutes; re-test with option 3.'
+        }
+    }
 }
 
 function Invoke-PubConnectExistingApp {
@@ -939,10 +1040,11 @@ function Invoke-PubSettingsMenu {
         Write-Host ('   2) When a PDF of that name exists in SharePoint: {0}' -f $script:Config['UploadConflictAction'])
         Write-Host ('   3) Remove the original .pub after upload       : {0}' -f $removeLabel)
         Write-Host ('   4) Working folder                              : {0}' -f $script:Config['DefaultWorkingFolder'])
+        Write-Host ('   5) Site enumeration method                     : {0}' -f $script:Config['EnumerationMethod'])
         Write-Host '   0) Back to the main menu'
         Write-Host ''
 
-        switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4')) {
+        switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5')) {
             '1' { Set-PubThreeWaySetting -Name 'ExistingPdfAction'   -Title 'Existing local PDF' }
             '2' { Set-PubThreeWaySetting -Name 'UploadConflictAction' -Title 'SharePoint name collision' }
             '3' {
@@ -974,6 +1076,22 @@ function Invoke-PubSettingsMenu {
                     $script:Config = Get-PubConfig
                     Get-PubWorkingFolder -Config $script:Config | Out-Null
                     Write-PubLog -Level Success -Message ('Working folder set to {0}' -f $entered)
+                }
+            }
+            '5' {
+                Write-Host ''
+                Write-Host '  How should discovery find sites?' -ForegroundColor Cyan
+                Write-Host '   1) Auto      - SharePoint tenant admin list when available, else Graph (default)'
+                Write-Host '   2) PnP       - insist on the tenant admin list; report loudly if it is unavailable'
+                Write-Host '   3) Graph     - never use PnP, even when it is installed'
+                Write-Host '   0) Cancel'
+                Write-Host ''
+
+                $map    = @{ '1' = 'Auto'; '2' = 'PnP'; '3' = 'Graph' }
+                $answer = Read-PubMenuChoice -Valid @('0', '1', '2', '3')
+                if ($answer -ne '0') {
+                    Set-PubConfigValue -Name 'EnumerationMethod' -Value $map[$answer] | Out-Null
+                    Write-PubLog -Level Success -Message ('Enumeration method set to {0}.' -f $map[$answer])
                 }
             }
             '0' { return }
@@ -1011,6 +1129,32 @@ function Set-PubThreeWaySetting {
 # ---------------------------------------------------------------------------
 # Startup checks and main loop
 # ---------------------------------------------------------------------------
+function Invoke-PubConnectionTest {
+    <#
+    .SYNOPSIS
+        Menu option 3 - tests Graph, SharePoint, and the enumeration route.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Test-PubGraphAccess -Config $script:Config | Out-Null
+
+    Write-Host ''
+    Write-Host '  SITE ENUMERATION' -ForegroundColor Cyan
+
+    if (Test-PubPnPEnumerationEnabled -Config $script:Config) {
+        Write-PubLog -Level Success -Message 'Tenant admin route available - discovery will find every site collection, including ones the search index misses.'
+    } else {
+        Write-PubLog -Level Warn -Message 'Tenant admin route unavailable - discovery will fall back to Graph enumeration, which can miss unindexed sites, very new sites and Teams private-channel sites.'
+        if (-not (Test-PubPnPAvailable -Quiet)) {
+            Write-PubLog -Level Info -Message 'Install PnP PowerShell to enable it: Install-Module PnP.PowerShell -Scope CurrentUser'
+        } elseif ([string] $script:Config['AuthMethod'] -ne 'TenantAdmin') {
+            Write-PubLog -Level Info -Message ('This app is registered with the "{0}" scope. The tenant admin route needs the TenantAdmin scope (setup option 1).' -f $script:Config['AuthMethod'])
+        }
+        Write-PubLog -Level Info -Message 'Either way you can scope a complete scan manually: SharePoint admin centre -> Active sites -> Export to CSV, then menu option 4.'
+    }
+}
+
 function Invoke-PubStartupCheck {
     [CmdletBinding()]
     param()
@@ -1067,7 +1211,7 @@ function Start-PubMenu {
             switch ($choice) {
                 '1'  { Show-PubAppRegistrationMenu }
                 '2'  { Invoke-PubCertificateSetup;  Wait-PubKeyPress }
-                '3'  { Test-PubGraphAccess -Config $script:Config | Out-Null; Wait-PubKeyPress }
+                '3'  { Invoke-PubConnectionTest; Wait-PubKeyPress }
                 '4'  { Invoke-PubScanMenu;          Wait-PubKeyPress }
                 '5'  { Invoke-PubExportInventory;   Wait-PubKeyPress }
                 '6'  { Invoke-PubLoadInventory;     Wait-PubKeyPress }
@@ -1080,6 +1224,7 @@ function Start-PubMenu {
                 '13' { Invoke-PubSettingsMenu }
                 '0'  {
                     Write-PubLog -Level Info -Message 'Exiting.'
+                    Disconnect-PubPnP
                     Disconnect-PubGraph
                     Stop-PubLogging
                     Write-Host ''
