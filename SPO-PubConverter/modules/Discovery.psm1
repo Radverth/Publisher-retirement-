@@ -93,14 +93,138 @@ function New-PubInventoryRow {
     return [pscustomobject] $row
 }
 
+function Get-PubScopeUrl {
+    <#
+    .SYNOPSIS
+        Reads a list of site URLs from a text or CSV file.
+
+    .DESCRIPTION
+        Accepts the SharePoint admin centre's own export as-is: Active sites ->
+        Export to CSV names its column 'URL', not 'SiteUrl'. That export comes
+        from the SharePoint tenant store rather than the search index, so it is
+        the one list guaranteed to contain every site collection - which makes
+        it the reliable way to scope a complete tenant crawl.
+
+        A plain text file is read one URL per line; lines starting with # are
+        ignored.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Path
+    )
+
+    $urls = New-Object System.Collections.Generic.List[string]
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-PubLog -Level Error -Message ('Scope file not found: {0}' -f $Path)
+        return @()
+    }
+
+    if ($Path -notlike '*.csv') {
+        foreach ($line in (Get-Content -LiteralPath $Path)) {
+            $trimmed = $line.Trim()
+            if ($trimmed -and -not $trimmed.StartsWith('#')) { $urls.Add($trimmed) }
+        }
+        return $urls.ToArray()
+    }
+
+    $rows = @(Import-Csv -LiteralPath $Path)
+    if ($rows.Count -eq 0) {
+        Write-PubLog -Level Warn -Message ('{0} contains no rows.' -f $Path)
+        return @()
+    }
+
+    # In preference order: this tool's own export, then the SharePoint admin
+    # centre export, then the obvious hand-rolled variants.
+    $candidates = @('SiteUrl', 'Site Url', 'Site URL', 'URL', 'Url', 'WebUrl', 'Web Url')
+    $columnName = $null
+
+    foreach ($candidate in $candidates) {
+        $match = $rows[0].PSObject.Properties | Where-Object { $_.Name -eq $candidate } | Select-Object -First 1
+        if ($match) { $columnName = $match.Name; break }
+    }
+
+    if (-not $columnName) {
+        $available = ($rows[0].PSObject.Properties.Name -join ', ')
+        Write-PubLog -Level Error -Message ('{0} has no site URL column. Looked for: {1}. Columns present: {2}' -f $Path, ($candidates -join ', '), $available)
+        return @()
+    }
+
+    Write-PubLog -Level Info -Message ('Reading site URLs from the "{0}" column of {1}.' -f $columnName, (Split-Path -Leaf $Path))
+
+    foreach ($row in $rows) {
+        $value = [string] $row.$columnName
+        if (-not [string]::IsNullOrWhiteSpace($value)) { $urls.Add($value.Trim()) }
+    }
+
+    return $urls.ToArray()
+}
+
+function Get-PubAllTenantSite {
+    <#
+    .SYNOPSIS
+        Enumerates every site in the tenant, trying the reliable routes first.
+
+    .DESCRIPTION
+        Access is not the constraint here - an app-only token with
+        Sites.Read.All can read any site regardless of who owns it or belongs
+        to it. The constraint is ENUMERATION: knowing a site exists in order to
+        crawl it. The three routes, best first:
+
+          1. v1.0 /sites/getAllSites  - tenant store, complete. Not yet
+             available in every tenant.
+          2. beta /sites/getAllSites  - same data, beta endpoint.
+          3. v1.0 /sites?search=*     - backed by the SEARCH INDEX, so it can
+             miss sites excluded from indexing, sites indexed too recently, and
+             Teams private-channel sites.
+
+        The route actually used is logged and returned, because a short site
+        count from route 3 is a coverage problem the operator needs to see, not
+        a quiet default. For a guaranteed-complete list, export Active sites
+        from the SharePoint admin centre and scope the scan to that CSV.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $routes = @(
+        [pscustomobject] @{ Name = 'v1.0 getAllSites'; Uri = 'sites/getAllSites';                                  Complete = $true  }
+        [pscustomobject] @{ Name = 'beta getAllSites'; Uri = 'https://graph.microsoft.com/beta/sites/getAllSites'; Complete = $true  }
+        [pscustomobject] @{ Name = 'site search';      Uri = 'sites?search=*&$select=id,webUrl,displayName,name';  Complete = $false }
+    )
+
+    foreach ($route in $routes) {
+        try {
+            $result = Get-PubGraphAll -Uri $route.Uri
+            if ($result -and @($result).Count -gt 0) {
+                return [pscustomobject] @{
+                    Sites    = @($result)
+                    Route    = $route.Name
+                    Complete = $route.Complete
+                }
+            }
+            Write-PubLog -Level Debug -Message ('{0} returned nothing - trying the next route.' -f $route.Name)
+        } catch {
+            Write-PubLog -Level Debug -Message ('{0} unavailable: {1}' -f $route.Name, (Get-PubGraphErrorMessage -ErrorRecord $_))
+        }
+    }
+
+    return [pscustomobject] @{ Sites = @(); Route = 'none'; Complete = $false }
+}
+
 function Get-PubSiteList {
     <#
     .SYNOPSIS
         Returns the sites to crawl.
 
+    .DESCRIPTION
+        With app-only authentication there is no user context, so site
+        ownership and membership are irrelevant - every site the app has been
+        consented to is readable. What varies is whether a site can be
+        enumerated in the first place; see Get-PubAllTenantSite.
+
     .PARAMETER ScopePath
-        Optional path to a text file of site URLs (one per line) or a CSV with a
-        SiteUrl column. Lines starting with # are ignored.
+        Optional path to a text file of site URLs (one per line) or a CSV -
+        including the SharePoint admin centre's Active sites export, unedited.
 
     .PARAMETER SiteUrl
         Optional explicit list of site URLs (comma separated at the menu).
@@ -128,21 +252,7 @@ function Get-PubSiteList {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ScopePath)) {
-        if (-not (Test-Path -LiteralPath $ScopePath)) {
-            Write-PubLog -Level Error -Message ('Scope file not found: {0}' -f $ScopePath)
-            return @()
-        }
-
-        if ($ScopePath -like '*.csv') {
-            foreach ($row in (Import-Csv -LiteralPath $ScopePath)) {
-                if ($row.PSObject.Properties['SiteUrl'] -and $row.SiteUrl) { $explicitUrls.Add(([string] $row.SiteUrl).Trim()) }
-            }
-        } else {
-            foreach ($line in (Get-Content -LiteralPath $ScopePath)) {
-                $trimmed = $line.Trim()
-                if ($trimmed -and -not $trimmed.StartsWith('#')) { $explicitUrls.Add($trimmed) }
-            }
-        }
+        foreach ($url in (Get-PubScopeUrl -Path $ScopePath)) { $explicitUrls.Add($url) }
     }
 
     if ($explicitUrls.Count -gt 0) {
@@ -164,26 +274,33 @@ function Get-PubSiteList {
     } else {
         Write-PubLog -Level Info -Message 'Enumerating every site the app registration can see...'
 
-        $allSites = @()
-        try {
-            $allSites = Get-PubGraphAll -Uri 'sites/getAllSites'
-        } catch {
-            Write-PubLog -Level Debug -Message ('getAllSites unavailable ({0}); falling back to site search.' -f (Get-PubGraphErrorMessage -ErrorRecord $_))
+        $enumeration = Get-PubAllTenantSite
+
+        if (@($enumeration.Sites).Count -eq 0) {
+            Write-PubLog -Level Error -Message 'Could not enumerate any sites. Check that admin consent has been granted for Sites.Read.All, then re-test with menu option 3.'
+            return @()
         }
 
-        if (-not $allSites -or $allSites.Count -eq 0) {
-            try {
-                $allSites = Get-PubGraphAll -Uri 'sites?search=*&$select=id,webUrl,displayName,name'
-            } catch {
-                Write-PubLog -Level Error -Message ('Could not enumerate sites: {0}' -f (Get-PubGraphErrorMessage -ErrorRecord $_))
-                return @()
-            }
+        Write-PubLog -Level Info -Message ('Enumeration route: {0} - {1} site(s) returned.' -f $enumeration.Route, @($enumeration.Sites).Count)
+
+        if (-not $enumeration.Complete) {
+            Write-PubLog -Level Warn -Message 'This route reads the SEARCH INDEX, so it can miss sites excluded from indexing, very new sites, and Teams private-channel sites.'
+            Write-PubLog -Level Warn -Message 'For a guaranteed-complete crawl: SharePoint admin centre -> Active sites -> Export to CSV, then re-run the scan scoped to that CSV.'
         }
 
-        foreach ($site in $allSites) {
+        $personalSkipped = 0
+        foreach ($site in $enumeration.Sites) {
             if (-not $site.PSObject.Properties['webUrl'] -or -not $site.webUrl) { continue }
-            if (-not $IncludePersonalSites -and $site.webUrl -match '-my\.sharepoint\.com') { continue }
+
+            if ($site.webUrl -match '-my\.sharepoint\.com') {
+                if (-not $IncludePersonalSites) { $personalSkipped++; continue }
+            }
+
             if ($seen.Add($site.id)) { $sites.Add($site) }
+        }
+
+        if ($personalSkipped -gt 0) {
+            Write-PubLog -Level Info -Message ('{0} OneDrive personal site(s) skipped. Choose "include OneDrive" at the scan scope prompt to crawl them too.' -f $personalSkipped)
         }
     }
 
@@ -450,11 +567,20 @@ function Invoke-PubDiscovery {
     Write-Progress -Activity 'Scanning SharePoint for .pub files' -Completed
 
     $elapsed = (Get-Date) - $started
+    $scopeLabel = 'every site the app can enumerate'
+    if ($ScopePath)               { $scopeLabel = 'site list from {0}' -f (Split-Path -Leaf $ScopePath) }
+    elseif ($SiteUrl -and @($SiteUrl).Count -gt 0) { $scopeLabel = '{0} site URL(s) supplied' -f @($SiteUrl).Count }
+
+    $oneDriveLabel = 'excluded'
+    if ($IncludePersonalSites) { $oneDriveLabel = 'included' }
+
     Write-PubPhaseSummary -Phase 'Discovery' `
                           -Attempted $sites.Count `
                           -Succeeded ($sites.Count - $sitesFailed) `
                           -Failed $sitesFailed `
                           -ExtraLines @(
+                              ('Scope             : {0}' -f $scopeLabel)
+                              ('OneDrive sites    : {0}' -f $oneDriveLabel)
                               ('Libraries crawled : {0}' -f $librariesCrawled)
                               ('Publisher files   : {0}' -f $rows.Count)
                               ('Elapsed           : {0:hh\:mm\:ss}' -f $elapsed)
@@ -632,6 +758,8 @@ function Get-PubInventoryStatistic {
 Export-ModuleMember -Function @(
     'Get-PubInventoryColumns'
     'New-PubInventoryRow'
+    'Get-PubScopeUrl'
+    'Get-PubAllTenantSite'
     'Get-PubSiteList'
     'Get-PubDocumentLibrary'
     'Get-PubDriveFolderPath'

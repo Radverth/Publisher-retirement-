@@ -494,15 +494,18 @@ function Invoke-PubScanMenu {
 
     $script:Config = Get-PubConfig
 
-    $scopePath = ''
-    $siteUrls  = @()
+    $scopePath    = ''
+    $siteUrls     = @()
+    $includeOneDrive = $false
 
     if (-not $Unattended) {
         Write-Host ''
         Write-Host '  SCAN SCOPE' -ForegroundColor Cyan
-        Write-Host '   1) Every site the app registration can see (full tenant crawl)'
+        Write-Host '   1) Every site the app registration can enumerate (full tenant crawl)'
         Write-Host '   2) Specific sites - type the URLs now (comma separated)'
         Write-Host '   3) Specific sites - read the URLs from a text or CSV file'
+        Write-Host '      (including the SharePoint admin centre Active sites export, unedited -'
+        Write-Host '       the one list guaranteed to contain every site collection)'
         Write-Host '   0) Cancel'
         Write-Host ''
 
@@ -528,9 +531,24 @@ function Invoke-PubScanMenu {
             }
             '0' { return }
         }
+
+        Write-Host ''
+        Write-Host '  ONEDRIVE (personal) SITES' -ForegroundColor Cyan
+        Write-Host '   1) SharePoint sites only (default)'
+        Write-Host '   2) Also crawl OneDrive for Business sites'
+        Write-Host '      Slower, and it reads every user''s personal files - only where the'
+        Write-Host '      Publisher retirement has to cover OneDrive too.'
+        Write-Host '   0) Cancel'
+        Write-Host ''
+
+        switch (Read-PubMenuChoice -Valid @('0', '1', '2')) {
+            '1' { $includeOneDrive = $false }
+            '2' { $includeOneDrive = $true }
+            '0' { return }
+        }
     }
 
-    $rows = Invoke-PubDiscovery -ScopePath $scopePath -SiteUrl $siteUrls -Config $script:Config
+    $rows = Invoke-PubDiscovery -ScopePath $scopePath -SiteUrl $siteUrls -IncludePersonalSites:$includeOneDrive -Config $script:Config
     if (-not $rows -or @($rows).Count -eq 0) {
         Write-PubLog -Level Warn -Message 'No Publisher files found in scope.'
         $script:Inventory = @()

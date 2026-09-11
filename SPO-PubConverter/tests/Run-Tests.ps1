@@ -186,6 +186,44 @@ try {
     Assert-PubTest (@(Import-PubInventory -Path $brokenPath).Count -eq 0) 'a CSV with no DriveId/ItemId is rejected with a clear message'
 
     # -----------------------------------------------------------------------
+    Write-PubTestSection 'Scan scope files, including the SharePoint admin centre export'
+    # -----------------------------------------------------------------------
+    $scopeText = Join-Path $tempRoot 'sites.txt'
+    @(
+        '# sites for the first test run'
+        'https://contoso.sharepoint.com/sites/Marketing'
+        ''
+        'https://contoso.sharepoint.com/sites/Sales'
+    ) | Set-Content -LiteralPath $scopeText
+
+    $textUrls = Get-PubScopeUrl -Path $scopeText
+    Assert-PubTest (@($textUrls).Count -eq 2) 'a text scope file reads one URL per line'
+    Assert-PubTest ($textUrls -notcontains '# sites for the first test run') 'comment lines are ignored'
+
+    # The admin centre's Active sites export: column is 'URL', not 'SiteUrl'.
+    $adminExport = Join-Path $tempRoot 'admin-export.csv'
+    @(
+        [pscustomobject] @{ 'Site name' = 'Marketing'; 'URL' = 'https://contoso.sharepoint.com/sites/Marketing'; 'Storage used (GB)' = '12.4' }
+        [pscustomobject] @{ 'Site name' = 'Sales';     'URL' = 'https://contoso.sharepoint.com/sites/Sales';     'Storage used (GB)' = '3.1' }
+    ) | Export-Csv -LiteralPath $adminExport -NoTypeInformation
+
+    $adminUrls = Get-PubScopeUrl -Path $adminExport
+    Assert-PubTest (@($adminUrls).Count -eq 2) 'the admin centre export loads unedited'
+    Assert-PubTest ($adminUrls[0] -eq 'https://contoso.sharepoint.com/sites/Marketing') 'URLs come from the admin export URL column'
+
+    foreach ($columnName in @('SiteUrl', 'Site URL', 'Url', 'WebUrl')) {
+        $aliasPath = Join-Path $tempRoot ('alias-{0}.csv' -f ($columnName -replace '\s', ''))
+        (New-Object psobject -Property @{ $columnName = 'https://contoso.sharepoint.com/sites/Ops' }) |
+            Select-Object $columnName | Export-Csv -LiteralPath $aliasPath -NoTypeInformation
+        Assert-PubTest (@(Get-PubScopeUrl -Path $aliasPath).Count -eq 1) ('a CSV using the "{0}" column is accepted' -f $columnName)
+    }
+
+    $noColumnPath = Join-Path $tempRoot 'no-url-column.csv'
+    [pscustomobject] @{ 'Site name' = 'Marketing'; 'Owner' = 'tom@contoso.com' } | Export-Csv -LiteralPath $noColumnPath -NoTypeInformation
+    Assert-PubTest (@(Get-PubScopeUrl -Path $noColumnPath).Count -eq 0) 'a CSV with no URL column is rejected rather than silently empty'
+    Assert-PubTest (@(Get-PubScopeUrl -Path (Join-Path $tempRoot 'does-not-exist.csv')).Count -eq 0) 'a missing scope file is reported, not thrown'
+
+    # -----------------------------------------------------------------------
     Write-PubTestSection 'Upload collision behaviour'
     # -----------------------------------------------------------------------
     Assert-PubTest ((Get-PubConflictBehavior -Action 'Version')   -eq 'rename')  'Version maps to Graph rename (the safe default)'

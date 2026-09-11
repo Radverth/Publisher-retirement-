@@ -133,6 +133,52 @@ needs `read`; the full pipeline needs `write`.
 Either way, delete the app registration when the project is done. It is a
 project tool, not permanent infrastructure.
 
+## Which sites get found
+
+**Ownership and membership are irrelevant.** Discovery runs app-only: the tool
+authenticates as the app registration with its certificate, with no user
+context at all. `Sites.Read.All` as an *application* permission covers every
+site collection in the tenant — private team sites, sites with broken
+inheritance, sites the operator has never been a member of and could not open
+in a browser. The operator's own account only matters during setup, to create
+the app and grant consent. (In `Sites.Selected` mode the opposite applies: only
+sites explicitly granted to the app are visible.)
+
+**Enumeration, not access, is the real limit.** The app can read any site; the
+question is whether the tool can *list* a site in order to go there. Three
+routes are tried, best first, and the one actually used is logged with the site
+count:
+
+| Route | Source | Complete? |
+|-------|--------|-----------|
+| `v1.0 /sites/getAllSites` | tenant store | yes — not yet available in every tenant |
+| `beta /sites/getAllSites` | tenant store | yes |
+| `v1.0 /sites?search=*` | **search index** | no — see below |
+
+If it falls through to site search, the scan prints a warning, because that
+route can miss sites excluded from search indexing, sites created too recently
+to be indexed, and Teams private-channel sites (which are separate site
+collections).
+
+**The guaranteed-complete route:** SharePoint admin centre → Active sites →
+**Export to CSV**, then menu `4` → *read the URLs from a text or CSV file*. That
+list comes from the SharePoint tenant store rather than the search index, so
+nothing is missing. The export loads unedited — its column is `URL`, and the
+loader also accepts `SiteUrl`, `Site URL`, `Url`, `WebUrl` or a plain text file
+of one URL per line with `#` comments.
+
+**OneDrive.** Personal (`-my.sharepoint.com`) sites are excluded by default and
+the scan reports how many it skipped. The scan-scope prompt offers to include
+them — slower, and it reads every user's personal files, so only where the
+Publisher retirement has to cover OneDrive too.
+
+Subsites are pulled in separately for every site found, on all routes, because
+site search does not reliably return them.
+
+A site can still be out of reach if a Restricted Access Control policy or a
+Graph application access policy blocks the app; those failures are logged
+per-site and do not stop the crawl.
+
 ## Certificates and secrets
 
 * Windows: `New-SelfSignedCertificate`, 2048-bit RSA/SHA-256, two-year default
@@ -260,11 +306,12 @@ and `Upload.psm1` import it rather than defining the format again.
 .\tests\Run-Tests.ps1
 ```
 
-75 offline checks: every file parses and every module imports, the CSV schema
+85 offline checks: every file parses and every module imports, the CSV schema
 matches the brief exactly, local paths mirror SharePoint without collisions,
 filters and status counts behave, config round-trips without persisting
 secrets, certificate expiry warns at the right thresholds, the
-skip/overwrite/version rule does what it says, and the preserved parts of Tom's
+skip/overwrite/version rule does what it says, scope files load (including the
+SharePoint admin centre export unedited), and the preserved parts of Tom's
 conversion script (the Interop enum, the COM pattern, `app.Quit()` in
 `finally`) are still there. Nothing touches a tenant, so it is safe to run any
 time — including on the Linux/macOS host you might be editing from.
@@ -292,4 +339,6 @@ time — including on the Linux/macOS host you might be editing from.
 | Everything `Failed` with `HTTP 403` | The app has no access to that site. In `Sites.Selected` mode each site needs its own grant. |
 | Conversion says Publisher is not available | Run the conversion phase on the Windows host with Publisher, per *Where each phase can run*. |
 | A batch stalls then every file in it fails | One file hung Publisher. The batch timed out and was killed; re-run option `8` and it resumes from the files with no result. Check Task Manager for a stray `MSPUB.EXE`. |
+| Scan found fewer sites than expected | It fell through to the search-index route — the log says which route was used. Re-run scoped to the admin centre's Active sites export. |
+| A known site is missing from the CSV | Same cause, or the site is blocked by a Restricted Access Control / application access policy (logged per site). |
 | Crawl is slow on a large tenant | Expected — it is per-site, per-library, per-folder. Scope the first run to a couple of sites using option `4` → *Specific sites*. |
