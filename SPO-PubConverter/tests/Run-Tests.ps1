@@ -182,7 +182,7 @@ try {
     Assert-PubTest ($originalPath -like '*originals*') 'downloads land under /working/originals'
     Assert-PubTest ($originalPath -like '*Shared Documents*') 'the library name is part of the local path'
     Assert-PubTest ($originalPath -like '*Q1 Drafts*Newsletter.pub') 'the folder tree is mirrored locally'
-    Assert-PubTest ($pdfPath -like '*converted*Newsletter.pdf') 'PDFs land under /working/converted'
+    Assert-PubTest ($pdfPath -like '*converted*Newsletter (converted).pdf') 'PDFs land under /working/converted, with the collision-safe name'
 
     $twinRow = New-PubInventoryRow -Values @{
         FileName = 'Newsletter.pub'; SiteUrl = 'https://contoso.sharepoint.com/sites/Sales'
@@ -190,6 +190,41 @@ try {
     }
     Assert-PubTest ((Get-PubLocalPath -Row $twinRow -Config $workingConfig) -ne $originalPath) 'the same file name in two sites cannot collide'
     Assert-PubTest ((ConvertTo-PubSafeSegment -Segment 'a/b:c*d') -eq 'a_b_c_d') 'unsafe path characters are replaced'
+
+    # -----------------------------------------------------------------------
+    Write-PubTestSection 'Converted PDF naming (no collision with an existing PDF)'
+    # -----------------------------------------------------------------------
+    # Newsletter.pub and Newsletter.pdf commonly sit side by side. Converting
+    # to a bare Newsletter.pdf would land on the user's existing file, so a
+    # suffix keeps them distinct.
+    $nameConfig = New-PubDefaultConfig
+    Assert-PubTest ($nameConfig['ConvertedFileSuffix'] -eq ' (converted)') 'a suffix is configured by default'
+    Assert-PubTest ((Get-PubPdfFileName -SourceFileName 'Newsletter.pub' -Config $nameConfig) -eq 'Newsletter (converted).pdf') 'the default naming cannot collide with an existing PDF'
+    Assert-PubTest ((Get-PubPdfFileName -SourceFileName 'Newsletter.pub' -Config $nameConfig) -ne 'Newsletter.pdf') 'the converted name is never the bare PDF name by default'
+
+    Assert-PubTest ((Get-PubPdfFileName -SourceFileName 'Report.final.pub' -Config $nameConfig) -eq 'Report.final (converted).pdf') 'only the last extension is replaced'
+    Assert-PubTest ((Get-PubPdfFileName -SourceFileName 'NoExtension' -Config $nameConfig) -eq 'NoExtension (converted).pdf') 'a name with no extension still works'
+    Assert-PubTest ((Get-PubPdfFileName -SourceFileName 'Newsletter.pub' -Suffix '') -eq 'Newsletter.pdf') 'an empty suffix gives the bare name for anyone who wants it'
+    Assert-PubTest ((Get-PubPdfFileName -SourceFileName 'Newsletter.pub' -Suffix '_converted') -eq 'Newsletter_converted.pdf') 'a custom suffix is applied'
+
+    # Characters SharePoint rejects must never reach a file name.
+    Assert-PubTest ((Get-PubFileNameSuffix -Suffix ' (a/b:c*d?)') -eq ' (abcd)') 'characters SharePoint rejects are stripped from the suffix'
+    Assert-PubTest ((Get-PubFileNameSuffix -Suffix '   ') -eq '')                'a whitespace-only suffix is treated as none'
+    Assert-PubTest ((Get-PubFileNameSuffix -Suffix (' x' * 60)).Length -le 40)   'an over-long suffix is capped'
+
+    $longName = ('a' * 300) + '.pub'
+    $longPdf  = Get-PubPdfFileName -SourceFileName $longName -Config $nameConfig
+    Assert-PubTest ($longPdf.Length -le 255)        'a very long name is trimmed to something SharePoint accepts'
+    Assert-PubTest ($longPdf.EndsWith(' (converted).pdf')) 'trimming keeps the suffix rather than losing the collision guard'
+
+    # The conversion step and the upload step must agree on the name.
+    $nameRow = New-PubInventoryRow -Values @{
+        FileName = 'Newsletter.pub'; SiteUrl = 'https://c.sharepoint.com/sites/A'
+        LibraryName = 'Docs'; FolderPath = '/'
+    }
+    $nameConfig['DefaultWorkingFolder'] = Join-Path $tempRoot 'naming'
+    $localPdf = Get-PubLocalPath -Row $nameRow -Kind Pdf -Config $nameConfig
+    Assert-PubTest ((Split-Path -Leaf $localPdf) -eq (Get-PubPdfFileName -SourceFileName 'Newsletter.pub' -Config $nameConfig)) 'the local file and the uploaded file use the same name'
 
     # -----------------------------------------------------------------------
     Write-PubTestSection 'Selection filters (menu option 6)'

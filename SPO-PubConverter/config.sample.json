@@ -13,6 +13,7 @@
   "SharePointAdminUrl": "",
   "DefaultWorkingFolder": "C:\\SPO-PubConverter\\working",
   "LastInventoryCsv": "C:\\SPO-PubConverter\\working\\inventory\\PublisherFileInventory_2026-09-11_1030.csv",
+  "ConvertedFileSuffix": " (converted)",
   "ExistingPdfAction": "Version",
   "UploadConflictAction": "Version",
   "RemoveSourceAfterUpload": false,

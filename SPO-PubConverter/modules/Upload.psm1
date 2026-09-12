@@ -274,7 +274,9 @@ function Invoke-PubUpload {
                        -CurrentOperation ([string] $row.FileName) `
                        -PercentComplete ([int] (($index / $eligible.Count) * 100))
 
-        $pdfName = [System.IO.Path]::ChangeExtension([string] $row.FileName, '.pdf')
+        # Same helper the conversion step used, so the uploaded name always
+        # matches the file that was produced locally.
+        $pdfName = Get-PubPdfFileName -SourceFileName ([string] $row.FileName) -Config $Config
 
         $parentItemId = [string] $row.ParentItemId
         if ([string]::IsNullOrWhiteSpace($parentItemId)) {

@@ -118,6 +118,7 @@ function New-PubDefaultConfig {
         SharePointAdminUrl      = ''                  # override; derived from the tenant domain when blank
         DefaultWorkingFolder    = (Join-Path $script:ProjectRoot 'working')
         LastInventoryCsv        = ''
+        ConvertedFileSuffix     = ' (converted)'      # appended before .pdf; '' for a bare name
         ExistingPdfAction       = 'Version'           # Skip | Overwrite | Version
         UploadConflictAction    = 'Version'           # Skip | Overwrite | Version
         RemoveSourceAfterUpload = $false
@@ -296,6 +297,84 @@ function Test-PubCertificateExpiry {
     }
 
     return $result
+}
+
+function Get-PubFileNameSuffix {
+    <#
+    .SYNOPSIS
+        Returns the configured suffix, cleaned so it is safe in a file name.
+
+    .DESCRIPTION
+        SharePoint rejects " * : < > ? / \ | in file names, and trims leading
+        and trailing spaces, so anything the operator types is filtered before
+        it reaches a name.
+    #>
+    [CmdletBinding()]
+    param(
+        $Config,
+        [string] $Suffix
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('Suffix')) {
+        if (-not $Config) { $Config = Get-PubConfig }
+        $Suffix = [string] $Config['ConvertedFileSuffix']
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Suffix)) { return '' }
+
+    $clean = $Suffix -replace '["\*:<>?/\\|]', ''
+    $clean = $clean -replace '[\x00-\x1f]', ''
+    $clean = $clean -replace '\s+', ' '
+    $clean = $clean.TrimEnd()
+
+    if ([string]::IsNullOrWhiteSpace($clean)) { return '' }
+    if ($clean.Length -gt 40) { $clean = $clean.Substring(0, 40).TrimEnd() }
+
+    return $clean
+}
+
+function Get-PubPdfFileName {
+    <#
+    .SYNOPSIS
+        The PDF name a .pub file converts to.
+
+    .DESCRIPTION
+        Newsletter.pub becomes "Newsletter (converted).pdf" by default. The
+        suffix exists so a converted PDF can never quietly land on top of a
+        PDF the user already had beside the .pub - a real case, since people
+        often keep Newsletter.pub and Newsletter.pdf in the same folder.
+
+        Used by BOTH the conversion step (for the local file) and the upload
+        step (for the SharePoint file), so the two can never disagree.
+
+    .EXAMPLE
+        Get-PubPdfFileName -SourceFileName 'Newsletter.pub'
+        Newsletter (converted).pdf
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $SourceFileName,
+        $Config,
+        [string] $Suffix
+    )
+
+    $suffixParameters = @{}
+    if ($PSBoundParameters.ContainsKey('Suffix')) { $suffixParameters['Suffix'] = $Suffix }
+    else { $suffixParameters['Config'] = $Config }
+
+    $cleanSuffix = Get-PubFileNameSuffix @suffixParameters
+
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($SourceFileName)
+    if ([string]::IsNullOrWhiteSpace($baseName)) { $baseName = $SourceFileName }
+
+    # A name over 255 characters is rejected outright, and a long name in a deep
+    # folder can breach the 400-character path limit, so trim the base rather
+    # than lose the suffix that prevents the collision.
+    $maxBase = 200 - $cleanSuffix.Length
+    if ($maxBase -lt 20) { $maxBase = 20 }
+    if ($baseName.Length -gt $maxBase) { $baseName = $baseName.Substring(0, $maxBase).TrimEnd() }
+
+    return ('{0}{1}.pdf' -f $baseName, $cleanSuffix)
 }
 
 function Get-PubWorkingFolder {
@@ -495,6 +574,8 @@ Export-ModuleMember -Function @(
     'Set-PubConfigValue'
     'Test-PubConfigComplete'
     'Test-PubCertificateExpiry'
+    'Get-PubFileNameSuffix'
+    'Get-PubPdfFileName'
     'Get-PubWorkingFolder'
     'Set-PubSecret'
     'Get-PubSecret'

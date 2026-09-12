@@ -196,7 +196,7 @@ function Get-PubLocalPath {
     }
 
     $fileName = [string] $Row.FileName
-    if ($Kind -eq 'Pdf') { $fileName = [System.IO.Path]::ChangeExtension($fileName, '.pdf') }
+    if ($Kind -eq 'Pdf') { $fileName = Get-PubPdfFileName -SourceFileName $fileName -Config $Config }
 
     return (Join-Path $path $fileName)
 }

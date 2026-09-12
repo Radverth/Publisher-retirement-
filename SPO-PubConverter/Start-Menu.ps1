@@ -513,6 +513,7 @@ function Show-PubMainMenu {
     if ([bool] $script:Config['RemoveSourceAfterUpload']) { $removeLabel = 'ORIGINALS DELETED after upload' }
 
     Write-PubMenuWrappedValue -Label 'Settings' -Parts @(
+        ('names: {0}' -f (Get-PubPdfFileName -SourceFileName 'file.pub' -Config $script:Config))
         ('existing PDF: {0}' -f $script:Config['ExistingPdfAction'])
         ('name clashes: {0}' -f $script:Config['UploadConflictAction'])
         $removeLabel
@@ -1563,10 +1564,11 @@ function Invoke-PubSettingsMenu {
         Write-Host ('   3) Remove the original .pub after upload       : {0}' -f $removeLabel)
         Write-Host ('   4) Working folder                              : {0}' -f $script:Config['DefaultWorkingFolder'])
         Write-Host ('   5) Site enumeration method                     : {0}' -f $script:Config['EnumerationMethod'])
+        Write-Host ('   6) Converted PDF file name                     : {0}' -f (Get-PubPdfFileName -SourceFileName 'Newsletter.pub' -Config $script:Config))
         Write-Host '   0) Back to the main menu'
         Write-Host ''
 
-        switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5')) {
+        switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5', '6')) {
             '1' { Set-PubThreeWaySetting -Name 'ExistingPdfAction'   -Title 'Existing local PDF' }
             '2' { Set-PubThreeWaySetting -Name 'UploadConflictAction' -Title 'SharePoint name collision' }
             '3' {
@@ -1617,9 +1619,72 @@ function Invoke-PubSettingsMenu {
                     Write-PubLog -Level Success -Message ('Enumeration method set to {0}.' -f $map[$answer])
                 }
             }
+            '6' { Set-PubConvertedNameSuffix }
             '0' { return }
         }
     }
+}
+
+function Set-PubConvertedNameSuffix {
+    <#
+    .SYNOPSIS
+        Chooses the text added to a converted PDF's name.
+
+    .DESCRIPTION
+        Without a suffix, Newsletter.pub converts to Newsletter.pdf - which
+        collides with a Newsletter.pdf the user already keeps beside it. The
+        collision rule would then rename or overwrite something, neither of
+        which is what anyone wants. A suffix keeps the converted file
+        obviously distinct.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $script:Config = Get-PubConfig
+
+    Write-Host ''
+    Write-Host '  CONVERTED PDF FILE NAME' -ForegroundColor Cyan
+    Write-Host '  Text added before .pdf so a converted file cannot land on top of a PDF'
+    Write-Host '  the user already has beside the .pub.'
+    Write-Host ''
+    Write-Host ('   1) Newsletter (converted).pdf      recommended')
+    Write-Host ('   2) Newsletter (from Publisher).pdf')
+    Write-Host ('   3) Newsletter_converted.pdf')
+    Write-Host ('   4) Type my own suffix')
+    Write-Host ('   5) Newsletter.pdf                  no suffix - can clash with an existing PDF')
+    Write-Host '   0) Cancel'
+    Write-Host ''
+
+    $suffix = $null
+    switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5')) {
+        '1' { $suffix = ' (converted)' }
+        '2' { $suffix = ' (from Publisher)' }
+        '3' { $suffix = '_converted' }
+        '4' {
+            $entered = Read-Host 'Suffix to add before .pdf (e.g. " (converted)")'
+            $suffix  = Get-PubFileNameSuffix -Suffix $entered
+
+            if ($entered -ne $suffix) {
+                Write-PubLog -Level Warn -Message ('SharePoint will not accept every character - the suffix will be "{0}".' -f $suffix)
+            }
+        }
+        '5' {
+            Write-Host ''
+            Write-Host '  With no suffix, a .pub whose folder already contains a PDF of the same' -ForegroundColor Yellow
+            Write-Host '  name relies on the collision rule alone, which renames it to' -ForegroundColor Yellow
+            Write-Host '  "Newsletter 1.pdf" or, if set to Overwrite, replaces the existing file.' -ForegroundColor Yellow
+            Write-Host ''
+            if (-not (Confirm-PubAction -Question 'Really convert with no suffix?')) { return }
+            $suffix = ''
+        }
+        '0' { return }
+    }
+
+    Set-PubConfigValue -Name 'ConvertedFileSuffix' -Value $suffix | Out-Null
+    $script:Config = Get-PubConfig
+
+    Write-PubLog -Level Success -Message ('Converted files will be named like "{0}".' -f (Get-PubPdfFileName -SourceFileName 'Newsletter.pub' -Config $script:Config))
+    Write-PubLog -Level Info -Message  'Files already converted locally keep their old name - re-run option 8 to produce the new one.'
 }
 
 function Set-PubThreeWaySetting {

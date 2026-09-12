@@ -341,10 +341,46 @@ columns are repaired on load; a CSV with no `DriveId`/`ItemId` is rejected with
 a message telling you to re-run discovery, because those rows cannot be
 uploaded back.
 
+## Converted file names
+
+`Newsletter.pub` converts to **`Newsletter (converted).pdf`**, not
+`Newsletter.pdf`.
+
+The suffix exists because people routinely keep `Newsletter.pub` and
+`Newsletter.pdf` side by side in the same folder. Without it, a converted file
+would land on the same name as the PDF the user already has, and the collision
+rule would decide what happens — renaming it to `Newsletter 1.pdf` (ambiguous)
+or, if set to Overwrite, replacing their file. The suffix removes that question
+entirely: the converted file is always visibly distinct, and the original PDF
+is never a candidate for replacement.
+
+Menu option `13` → `6` sets it, with a live example of the resulting name:
+
+| Choice | Result |
+|--------|--------|
+| ` (converted)` (default) | `Newsletter (converted).pdf` |
+| ` (from Publisher)` | `Newsletter (from Publisher).pdf` |
+| `_converted` | `Newsletter_converted.pdf` |
+| your own text | as typed |
+| none | `Newsletter.pdf` — asks for confirmation, since it can clash |
+
+Characters SharePoint rejects (`" * : < > ? / \ |`) are stripped from anything
+typed, the suffix is capped at 40 characters, and a very long source name is
+trimmed so the result stays within SharePoint's limits — the suffix is kept in
+preference to the tail of the name, because it is what prevents the collision.
+
+The same helper names the local file and the uploaded file, so the two can
+never diverge. The collision rules below still apply as a second line of
+defence, for the case where a converted PDF of that exact name is already
+there from a previous run.
+
+Changing this does not rename files already converted; re-run option `8` to
+produce them under the new name.
+
 ## Existing files: skip, overwrite or version
 
-Menu option `13` sets both rules — plus the working folder and the site
-enumeration method (`Auto` / `PnP` / `Graph`). Neither collision rule is
+Menu option `13` sets both rules — plus the converted file name, the working
+folder and the site enumeration method (`Auto` / `PnP` / `Graph`). Neither collision rule is
 hardcoded.
 
 | Setting | Applies to | `Skip` | `Overwrite` | `Version` (default) |
@@ -460,7 +496,7 @@ and `Upload.psm1` import it rather than defining the format again.
 .\tests\Run-Tests.ps1
 ```
 
-200 offline checks: every file parses and every module imports, the CSV schema
+213 offline checks: every file parses and every module imports, the CSV schema
 matches the brief exactly, local paths mirror SharePoint without collisions,
 filters and status counts behave, config round-trips without persisting
 secrets, certificate expiry warns at the right thresholds, the
