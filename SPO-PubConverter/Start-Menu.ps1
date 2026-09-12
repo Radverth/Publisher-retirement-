@@ -639,16 +639,18 @@ function Show-PubAppRegistrationMenu {
         Write-Host '   2) Connect to an existing app registration (enter App ID + Tenant ID)'
         Write-Host '   3) Re-check the configured app registration and its consent'
         Write-Host '   4) Grant this app access to one specific site (Sites.Selected mode)'
-        Write-Host '   5) Show the permissions this app needs and what they expose'
+        Write-Host '   5) Change this app''s permission scope (e.g. add SharePoint admin)'
+        Write-Host '   6) Show the permissions this app needs and what they expose'
         Write-Host '   0) Back to the main menu'
         Write-Host ''
 
-        switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5')) {
+        switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3', '4', '5', '6')) {
             '1' { Invoke-PubCreateAppRegistration; Wait-PubKeyPress }
             '2' { Invoke-PubConnectExistingApp;     Wait-PubKeyPress }
             '3' { Invoke-PubRecheckAppRegistration; Wait-PubKeyPress }
             '4' { Invoke-PubGrantSiteAccess;        Wait-PubKeyPress }
-            '5' { Show-PubPermissionTable -AuthMethod ([string] $script:Config['AuthMethod']); Wait-PubKeyPress }
+            '5' { Invoke-PubChangeScope;            Wait-PubKeyPress }
+            '6' { Show-PubPermissionTable -AuthMethod ([string] $script:Config['AuthMethod']); Wait-PubKeyPress }
             '0' { return }
         }
     }
@@ -802,6 +804,7 @@ function Invoke-PubPnPRegistration {
     $script:Config['CertificateThumbprint'] = [string] $registration.Thumbprint
     $script:Config['CertificatePublicPath'] = [string] $registration.CerPath
     $script:Config['CertificatePfxPath']    = [string] $registration.PfxPath
+    $script:Config['CertificateSecretName'] = Get-PubCertificateSecretName -PfxPath ([string] $registration.PfxPath)
 
     if ($registration.NotAfter) {
         $script:Config['CertificateExpiry'] = $registration.NotAfter.ToString('yyyy-MM-dd')
@@ -916,6 +919,78 @@ function Invoke-PubRecheckAppRegistration {
     Write-PubLog -Level Info -Message $expiry.Message
 }
 
+function Invoke-PubChangeScope {
+    <#
+    .SYNOPSIS
+        Moves the existing app registration to a different permission scope.
+
+    .DESCRIPTION
+        The usual reason to come here: the app was registered with the
+        tenant-wide Graph scope, and site discovery is therefore falling back to
+        the search index. Adding the SharePoint admin permission turns on the
+        complete tenant admin site list without creating a second app or
+        re-issuing the certificate.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $script:Config = Get-PubConfig
+
+    if ([string]::IsNullOrWhiteSpace([string] $script:Config['AppId'])) {
+        Write-PubLog -Level Warn -Message 'No app registration configured yet - use option 1 or 2 first.'
+        return
+    }
+
+    Write-Host ''
+    Write-Host '  CHANGE PERMISSION SCOPE' -ForegroundColor Cyan
+    Write-Host ('  This app is currently registered with: {0}' -f $script:Config['AuthMethod'])
+    Write-Host ''
+    Write-Host '   1) Tenant-wide + SharePoint admin - FULLY AUTOMATIC site discovery'
+    Write-Host '      Adds SharePoint Sites.FullControl.All to the app you already have.'
+    Write-Host '      Keeps the same App ID and certificate - nothing to re-issue.'
+    Write-Host '   2) Tenant-wide Graph only (no SharePoint admin)'
+    Write-Host '   3) Selected sites only (Sites.Selected)'
+    Write-Host '   0) Cancel'
+    Write-Host ''
+
+    $target = ''
+    switch (Read-PubMenuChoice -Valid @('0', '1', '2', '3')) {
+        '1' { $target = 'TenantAdmin' }
+        '2' { $target = 'AllSites' }
+        '3' { $target = 'SitesSelected' }
+        '0' { return }
+    }
+
+    Show-PubPermissionTable -AuthMethod $target
+
+    Write-Host '  Permissions already requested are kept. Anything you want REMOVED must be' -ForegroundColor Yellow
+    Write-Host '  revoked in the Entra ID portal, so the change is visible and audited there.' -ForegroundColor Yellow
+    Write-Host ''
+
+    if (-not (Confirm-PubAction -Question ('Move this app registration to the {0} scope?' -f $target))) {
+        Write-PubLog -Level Warn -Message 'Cancelled - nothing was changed.'
+        return
+    }
+
+    if (-not (Connect-PubGraphInteractive -TenantId ([string] $script:Config['TenantId']))) { return }
+
+    $updated = Update-PubAppPermissionScope -AppId ([string] $script:Config['AppId']) `
+                                            -TenantId ([string] $script:Config['TenantId']) `
+                                            -AuthMethod $target `
+                                            -ApplicationObjectId ([string] $script:Config['AppObjectId'])
+
+    if (-not $updated) {
+        Write-PubLog -Level Warn -Message 'Scope change did not complete - the recorded scope is unchanged.'
+        return
+    }
+
+    $script:Config['AuthMethod'] = $target
+    Save-PubConfig -Config $script:Config | Out-Null
+    $script:VerifiedRoute = ''
+
+    Write-PubLog -Level Success -Message ('This app is now registered with the {0} scope.' -f $target)
+}
+
 function Invoke-PubGrantSiteAccess {
     [CmdletBinding()]
     param()
@@ -1011,6 +1086,7 @@ function Invoke-PubCertificateSetup {
     $script:Config['CertificateExpiry']     = $certificate.NotAfter.ToString('yyyy-MM-dd')
     $script:Config['CertificatePublicPath'] = $certificate.CerPath
     $script:Config['CertificatePfxPath']    = $certificate.PfxPath
+    $script:Config['CertificateSecretName'] = [string] $certificate.SecretName
     Save-PubConfig -Config $script:Config | Out-Null
 
     Write-Host ''

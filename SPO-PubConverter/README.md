@@ -301,6 +301,13 @@ per-site and do not stop the crawl.
   `config.json`, the CSV or the logs. (`Export-Clixml` only encrypts on
   Windows; register a SecretManagement vault if you use the OpenSSL path in
   anger.)
+* The password is stored under a name derived from the `.pfx` file itself
+  (`PfxPassword_<pfx file name>`), recorded in config as
+  `CertificateSecretName`, and looked up the same way — so the writer and the
+  reader can never disagree about the key. Older spellings are still read, so a
+  certificate created by an earlier build keeps working.
+* The `.certs` and `.secrets` folders belong together: copying the tool to
+  another machine without `.secrets` leaves a `.pfx` that cannot be opened.
 * `Save-PubConfig` actively refuses to persist any key whose name looks like a
   secret, so a later edit cannot start leaking one by accident.
 * Expiry is re-checked **at every startup**, not just during setup, and warns
@@ -423,7 +430,7 @@ and `Upload.psm1` import it rather than defining the format again.
 .\tests\Run-Tests.ps1
 ```
 
-149 offline checks: every file parses and every module imports, the CSV schema
+156 offline checks: every file parses and every module imports, the CSV schema
 matches the brief exactly, local paths mirror SharePoint without collisions,
 filters and status counts behave, config round-trips without persisting
 secrets, certificate expiry warns at the right thresholds, the
@@ -458,6 +465,9 @@ time — including on the Linux/macOS host you might be editing from.
 | Everything `Failed` with `HTTP 403` | The app has no access to that site. In `Sites.Selected` mode each site needs its own grant. |
 | Conversion says Publisher is not available | Run the conversion phase on the Windows host with Publisher, per *Where each phase can run*. |
 | A batch stalls then every file in it fails | One file hung Publisher. The batch timed out and was killed; re-run option `8` and it resumes from the files with no result. Check Task Manager for a stray `MSPUB.EXE`. |
+| `The certificate data cannot be read with the provided password` | Fixed — the password was stored under one name and read under another. Update to the current version; your existing certificate and `.pfx` still work, nothing needs re-issuing. |
+| Same error after updating | The `.secrets` folder is missing (not copied from the machine that ran setup, or deleted). Re-run setup option `2` for a fresh certificate. |
+| Discovery says the tenant admin route needs the TenantAdmin scope | The app was registered tenant-wide without the SharePoint permission. Menu `1` → option `5` adds it to the app you already have, keeping the same App ID and certificate. |
 | PnP admin sign-in fails with 403 | The app lacks SharePoint `Sites.FullControl.All`, or the grant has not replicated yet (it can take several minutes). Re-test with option `3`. |
 | Setup offers no one-step path | PnP is not installed, or the host is on PowerShell 5.1. Both are fine — the Graph step-by-step path does the same job. |
 | Scan found fewer sites than expected | It fell through to the search-index route — the log says which route was used. Re-run scoped to the admin centre's Active sites export. |

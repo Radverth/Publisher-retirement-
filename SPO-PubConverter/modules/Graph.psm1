@@ -138,19 +138,28 @@ function Get-PubCertificate {
         Write-PubLog -Level Warn -Message ("Certificate {0} not found in CurrentUser\My or LocalMachine\My." -f $thumbprint)
     }
 
-    $pfxPath = $Config['CertificatePfxPath']
+    $pfxPath = [string] $Config['CertificatePfxPath']
     if (-not [string]::IsNullOrWhiteSpace($pfxPath) -and (Test-Path -LiteralPath $pfxPath)) {
-        try {
-            $password = Get-PubSecret -Name ('PfxPassword_{0}' -f $Config['AppId'])
-            if ($password) {
-                return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (
-                    $pfxPath, $password, 'EphemeralKeySet'
-                )
-            }
-            return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 ($pfxPath)
-        } catch {
-            Write-PubLog -Level Error -Message ('Could not load certificate from {0}: {1}' -f $pfxPath, $_.Exception.Message)
+        $password = Get-PubCertificatePassword -Config $Config
+        if (-not $password) {
+            # Opening a password-protected .pfx with no password fails with a
+            # misleading "data cannot be read" error, so stop here instead.
+            return $null
         }
+
+        # EphemeralKeySet keeps the private key out of any on-disk store, but is
+        # not supported on every platform - fall back to the default flags.
+        foreach ($flags in @('EphemeralKeySet', 'DefaultKeySet')) {
+            try {
+                return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (
+                    $pfxPath, $password, $flags
+                )
+            } catch {
+                Write-PubLog -Level Debug -Message ('Loading {0} with {1} failed: {2}' -f $pfxPath, $flags, $_.Exception.Message)
+            }
+        }
+
+        Write-PubLog -Level Error -Message ('Could not load the certificate from {0}. If it was created on another machine, copy the .secrets folder across as well, or re-run setup option 2.' -f $pfxPath)
     }
 
     return $null

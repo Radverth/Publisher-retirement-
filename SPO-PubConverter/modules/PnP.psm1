@@ -188,8 +188,12 @@ function Connect-PubPnPAdmin {
             }
             $parameters['CertificatePath'] = $pfxPath
 
-            $password = Get-PubSecret -Name ('PfxPassword_{0}' -f $Config['AppId'])
-            if ($password) { $parameters['CertificatePassword'] = $password }
+            $password = Get-PubCertificatePassword -Config $Config
+            if (-not $password) {
+                Write-PubLog -Level Warn -Message 'The .pfx password could not be found, so PnP cannot open the certificate.'
+                return $false
+            }
+            $parameters['CertificatePassword'] = $password
         }
 
         Connect-PnPOnline @parameters

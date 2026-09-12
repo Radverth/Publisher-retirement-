@@ -511,6 +511,7 @@ function New-PubAuthCertificate {
                 NotAfter   = $certificate.NotAfter
                 CerPath    = $cerPath
                 PfxPath    = ''
+                SecretName = ''
                 Base64     = [System.Convert]::ToBase64String($certificate.RawData)
             }
         } catch {
@@ -541,7 +542,8 @@ function New-PubAuthCertificate {
         if ($LASTEXITCODE -ne 0) { throw 'openssl pkcs12 failed.' }
 
         $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
-        Set-PubSecret -Name ('PfxPassword_{0}' -f $safeName) -Secret $securePassword | Out-Null
+        $secretName     = Get-PubCertificateSecretName -PfxPath $pfxPath
+        Set-PubSecret -Name $secretName -Secret $securePassword | Out-Null
         $password = $null
 
         $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 ($cerPath)
@@ -554,6 +556,7 @@ function New-PubAuthCertificate {
             NotAfter   = $x509.NotAfter
             CerPath    = $cerPath
             PfxPath    = $pfxPath
+            SecretName = $secretName
             Base64     = [System.Convert]::ToBase64String($x509.RawData)
         }
     } catch {
@@ -608,6 +611,123 @@ function Add-PubCertificateToApp {
         Write-PubLog -Level Error -Message ('Could not upload the certificate: {0}' -f (Get-PubGraphErrorMessage -ErrorRecord $_))
         return $false
     }
+}
+
+function Update-PubAppPermissionScope {
+    <#
+    .SYNOPSIS
+        Changes an existing app registration's permission scope in place.
+
+    .DESCRIPTION
+        Lets an app registered with one scope move to another - most usefully
+        AllSites -> TenantAdmin, which adds the SharePoint permission needed to
+        read the tenant admin site list, without creating a second app
+        registration or re-issuing the certificate.
+
+        Permissions already requested are preserved; the target scope's
+        permissions are added on top, then consented. Reducing scope removes
+        nothing from the app, because the safe way to drop a permission is to
+        revoke its grant in the portal where the change is visible and audited -
+        this reports what to remove instead of silently doing it.
+
+    .PARAMETER AuthMethod
+        The scope to move to.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $AppId,
+        [Parameter(Mandatory)] [string] $TenantId,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('AllSites', 'SitesSelected', 'TenantAdmin')]
+        [string] $AuthMethod,
+
+        [string] $ApplicationObjectId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ApplicationObjectId)) {
+        $application = Get-PubApplication -AppId $AppId
+        if (-not $application) {
+            Write-PubLog -Level Error -Message ('App registration {0} was not found in this tenant.' -f $AppId)
+            return $false
+        }
+        $ApplicationObjectId = $application.id
+    }
+
+    try {
+        $current = Invoke-PubGraph -Uri ("applications/{0}?`$select=requiredResourceAccess" -f $ApplicationObjectId) -Method GET
+    } catch {
+        Write-PubLog -Level Error -Message ('Could not read the current permissions: {0}' -f (Get-PubGraphErrorMessage -ErrorRecord $_))
+        return $false
+    }
+
+    # Index what the app already asks for, so nothing in use is dropped.
+    $existing = @{}
+    if ($current -and $current.PSObject.Properties['requiredResourceAccess'] -and $current.requiredResourceAccess) {
+        foreach ($resource in $current.requiredResourceAccess) {
+            $ids = New-Object System.Collections.Generic.List[string]
+            foreach ($access in $resource.resourceAccess) { $ids.Add([string] $access.id) }
+            $existing[[string] $resource.resourceAppId] = $ids
+        }
+    }
+
+    $added = 0
+    foreach ($resourceName in @('Graph', 'SharePoint')) {
+        $forResource = @(Get-PubPermissionCatalog -AuthMethod $AuthMethod | Where-Object { $_.Resource -eq $resourceName })
+        if ($forResource.Count -eq 0) { continue }
+
+        $resourceAppId            = Get-PubResourceAppId -Resource $resourceName
+        $resourceServicePrincipal = Get-PubServicePrincipal -AppId $resourceAppId
+
+        if (-not $existing.ContainsKey($resourceAppId)) {
+            $existing[$resourceAppId] = New-Object System.Collections.Generic.List[string]
+        }
+
+        foreach ($permission in $forResource) {
+            $roleId = Resolve-PubAppRole -Permission $permission -ResourceServicePrincipal $resourceServicePrincipal
+            if (-not $roleId) { continue }
+
+            if ($existing[$resourceAppId] -contains $roleId) {
+                Write-PubLog -Level Info -Message ('{0} ({1}) is already requested.' -f $permission.Name, $resourceName)
+                continue
+            }
+
+            $existing[$resourceAppId].Add($roleId)
+            $added++
+            Write-PubLog -Level Info -Message ('Adding {0} ({1}).' -f $permission.Name, $resourceName)
+        }
+    }
+
+    if ($added -eq 0) {
+        Write-PubLog -Level Success -Message 'The app already requests everything this scope needs - nothing to add.'
+    } else {
+        $requiredResourceAccess = @()
+        foreach ($resourceAppId in $existing.Keys) {
+            $resourceAccess = @()
+            foreach ($id in $existing[$resourceAppId]) { $resourceAccess += @{ id = $id; type = 'Role' } }
+            if ($resourceAccess.Count -gt 0) {
+                $requiredResourceAccess += @{ resourceAppId = $resourceAppId; resourceAccess = $resourceAccess }
+            }
+        }
+
+        try {
+            Invoke-PubGraph -Uri ("applications/{0}" -f $ApplicationObjectId) -Method PATCH -Body @{ requiredResourceAccess = $requiredResourceAccess } -ContentType 'application/json' | Out-Null
+            Write-PubLog -Level Success -Message ('{0} permission(s) added to the app registration.' -f $added)
+        } catch {
+            Write-PubLog -Level Error -Message ('Could not update the permissions: {0}' -f (Get-PubGraphErrorMessage -ErrorRecord $_))
+            return $false
+        }
+    }
+
+    Write-PubLog -Level Info -Message 'Granting consent for the scope...'
+    $consented = Grant-PubAdminConsent -AppId $AppId -AuthMethod $AuthMethod -TenantId $TenantId
+
+    if ($consented) {
+        Write-PubLog -Level Success -Message 'Scope updated and consented.'
+        Write-PubLog -Level Info -Message  'SharePoint permission changes can take several minutes to take effect - re-test with menu option 3.'
+    }
+
+    return $consented
 }
 
 function Grant-PubSiteSelectedPermission {
@@ -754,6 +874,7 @@ Export-ModuleMember -Function @(
     'Test-PubAdminConsent'
     'New-PubAuthCertificate'
     'Add-PubCertificateToApp'
+    'Update-PubAppPermissionScope'
     'Grant-PubSiteSelectedPermission'
     'Test-PubGraphAccess'
     'Get-PubAppRegistrationStatus'

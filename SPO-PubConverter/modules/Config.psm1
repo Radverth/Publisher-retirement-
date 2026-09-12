@@ -73,6 +73,7 @@ function New-PubDefaultConfig {
         CertificateExpiry       = ''
         CertificatePublicPath   = ''
         CertificatePfxPath      = ''
+        CertificateSecretName   = ''   # where the .pfx password is stored (never the password itself)
         AuthMethod              = 'AllSites'          # AllSites | SitesSelected | TenantAdmin
         EnumerationMethod       = 'Auto'              # Auto | PnP | Graph
         SharePointAdminUrl      = ''                  # override; derived from the tenant domain when blank
@@ -341,6 +342,82 @@ function Set-PubSecret {
     return 'LocalFile'
 }
 
+function Get-PubCertificateSecretName {
+    <#
+    .SYNOPSIS
+        The name the .pfx password is stored under, derived from the .pfx path.
+
+    .DESCRIPTION
+        Keyed off the certificate file itself so the writer and the reader
+        always agree. An earlier build stored it under the certificate subject
+        name but read it back under the App ID, which meant the password was
+        never found and the .pfx was opened with none at all.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $PfxPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PfxPath)) { return '' }
+    return ('PfxPassword_{0}' -f [System.IO.Path]::GetFileNameWithoutExtension($PfxPath))
+}
+
+function Get-PubCertificatePassword {
+    <#
+    .SYNOPSIS
+        Retrieves the .pfx password for the configured certificate.
+
+    .DESCRIPTION
+        Tries the name recorded in config first, then the name derived from the
+        .pfx file, then the older App ID and thumbprint spellings, so a
+        certificate created by any previous version of this tool still opens
+        without being regenerated.
+
+        Returns $null when nothing is found - callers must treat that as "do
+        not attempt to open the .pfx", not as "use an empty password".
+    #>
+    [CmdletBinding()]
+    param(
+        $Config,
+        [switch] $Quiet
+    )
+
+    if (-not $Config) { $Config = Get-PubConfig }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    $recorded = [string] $Config['CertificateSecretName']
+    if (-not [string]::IsNullOrWhiteSpace($recorded)) { $candidates.Add($recorded) }
+
+    $fromFile = Get-PubCertificateSecretName -PfxPath ([string] $Config['CertificatePfxPath'])
+    if (-not [string]::IsNullOrWhiteSpace($fromFile)) { $candidates.Add($fromFile) }
+
+    foreach ($legacy in @($Config['AppId'], $Config['CertificateThumbprint'])) {
+        if (-not [string]::IsNullOrWhiteSpace([string] $legacy)) { $candidates.Add(('PfxPassword_{0}' -f $legacy)) }
+    }
+
+    $tried = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $candidates) {
+        if ($tried -contains $name) { continue }
+        $tried.Add($name)
+
+        $secret = Get-PubSecret -Name $name
+        if ($secret) {
+            Write-PubLog -Level Debug -Message ('Certificate password found under "{0}".' -f $name)
+            return $secret
+        }
+    }
+
+    if (-not $Quiet) {
+        Write-PubLog -Level Error -Message ('No stored password found for {0}.' -f $Config['CertificatePfxPath'])
+        Write-PubLog -Level Info  -Message ('Looked for: {0}' -f ($tried -join ', '))
+        Write-PubLog -Level Info  -Message ('In the SecretManagement vault, and in {0}' -f (Join-Path $script:ProjectRoot '.secrets'))
+        Write-PubLog -Level Info  -Message 'If the password is genuinely gone, re-run setup option 2 to generate and upload a replacement certificate.'
+    }
+
+    return $null
+}
+
 function Get-PubSecret {
     <#
     .SYNOPSIS
@@ -381,4 +458,6 @@ Export-ModuleMember -Function @(
     'Get-PubWorkingFolder'
     'Set-PubSecret'
     'Get-PubSecret'
+    'Get-PubCertificateSecretName'
+    'Get-PubCertificatePassword'
 )

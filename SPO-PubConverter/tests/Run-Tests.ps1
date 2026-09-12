@@ -88,6 +88,44 @@ try {
     Assert-PubTest ((Get-Content -LiteralPath $configPath -Raw) -notmatch 'this-must-never-be-written') 'no secret material reaches config.json'
 
     # -----------------------------------------------------------------------
+    Write-PubTestSection 'Certificate password lookup (regression: key mismatch)'
+    # -----------------------------------------------------------------------
+    # An earlier build stored the .pfx password under the certificate SUBJECT
+    # name but read it back under the APP ID, so the password was never found
+    # and the .pfx was opened with none - "the certificate data cannot be read
+    # with the provided password". These checks pin the storage and lookup keys
+    # together, and keep the older spellings readable.
+    $certDir = Join-Path $tempRoot 'certs'
+    New-Item -Path $certDir -ItemType Directory -Force | Out-Null
+    $pfxFile = Join-Path $certDir 'SPO-PubConverter-5bde7888.pfx'
+    Set-Content -LiteralPath $pfxFile -Value 'not a real pfx'
+
+    Assert-PubTest ((Get-PubCertificateSecretName -PfxPath $pfxFile) -eq 'PfxPassword_SPO-PubConverter-5bde7888') 'the secret name is derived from the .pfx file name'
+    Assert-PubTest ((Get-PubCertificateSecretName -PfxPath '') -eq '') 'no .pfx means no secret name'
+
+    $secretConfig = New-PubDefaultConfig
+    $secretConfig['AppId']              = '5bde7888-1111-2222-3333-444444444444'
+    $secretConfig['CertificatePfxPath'] = $pfxFile
+
+    Assert-PubTest ($null -eq (Get-PubCertificatePassword -Config $secretConfig -Quiet)) 'a missing password returns nothing rather than an empty one'
+
+    # Store it the way the old build did - under the certificate subject name.
+    Set-PubSecret -Name 'PfxPassword_SPO-PubConverter-5bde7888' -Secret (ConvertTo-SecureString 'subject-keyed' -AsPlainText -Force) | Out-Null
+    $recovered = Get-PubCertificatePassword -Config $secretConfig -Quiet
+    Assert-PubTest ($null -ne $recovered) 'a password stored by the older build is still found (no certificate regeneration needed)'
+    Assert-PubTest ([System.Net.NetworkCredential]::new('', $recovered).Password -eq 'subject-keyed') 'the recovered password is the one that was stored'
+
+    # And the name recorded in config wins when it is present.
+    Set-PubSecret -Name 'PfxPassword_explicit' -Secret (ConvertTo-SecureString 'config-keyed' -AsPlainText -Force) | Out-Null
+    $secretConfig['CertificateSecretName'] = 'PfxPassword_explicit'
+    $explicit = Get-PubCertificatePassword -Config $secretConfig -Quiet
+    Assert-PubTest ([System.Net.NetworkCredential]::new('', $explicit).Password -eq 'config-keyed') 'the secret name recorded in config takes priority'
+
+    Assert-PubTest ((New-PubDefaultConfig).Contains('CertificateSecretName')) 'CertificateSecretName is part of the config schema'
+
+    Remove-Item -Path (Join-Path (Get-PubProjectRoot) '.secrets') -Recurse -Force -ErrorAction SilentlyContinue
+
+    # -----------------------------------------------------------------------
     Write-PubTestSection 'Certificate expiry is checked, with a 30-day warning'
     # -----------------------------------------------------------------------
     $certConfig = New-PubDefaultConfig
