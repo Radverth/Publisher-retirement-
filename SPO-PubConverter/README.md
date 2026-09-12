@@ -460,7 +460,7 @@ and `Upload.psm1` import it rather than defining the format again.
 .\tests\Run-Tests.ps1
 ```
 
-189 offline checks: every file parses and every module imports, the CSV schema
+200 offline checks: every file parses and every module imports, the CSV schema
 matches the brief exactly, local paths mirror SharePoint without collisions,
 filters and status counts behave, config round-trips without persisting
 secrets, certificate expiry warns at the right thresholds, the
@@ -471,8 +471,9 @@ a full discovery crawl runs against stubbed Graph responses (site resolution, li
 matching, row construction), the menu renders correctly in every state
 (right options, right order, correct next step, nothing wider than 80
 columns), and the preserved parts of Tom's conversion script (the Interop enum, the COM pattern, `app.Quit()` in
-`finally`) are still there. Nothing touches a tenant, so it is safe to run any
-time — including on the Linux/macOS host you might be editing from.
+`finally`) are still there. The suite runs under `Set-StrictMode -Version 2.0`, the same as the modules, so
+an empty-collection bug cannot pass here and then throw on a live tenant.
+Nothing touches a tenant, so it is safe to run any time — including on the Linux/macOS host you might be editing from.
 
 ## Known limits and future considerations
 
@@ -497,6 +498,7 @@ time — including on the Linux/macOS host you might be editing from.
 | Everything `Failed` with `HTTP 403` | The app has no access to that site. In `Sites.Selected` mode each site needs its own grant. |
 | Conversion says Publisher is not available | Run the conversion phase on the Windows host with Publisher, per *Where each phase can run*. |
 | A batch stalls then every file in it fails | One file hung Publisher. The batch timed out and was killed; re-run option `8` and it resumes from the files with no result. Check Task Manager for a stray `MSPUB.EXE`. |
+| `Skipped a folder in ... The property 'Count' cannot be found on this object` | Fixed. Empty folders returned an empty page, and an empty array returned from a PowerShell function unrolls to `$null`, so counting it threw under `Set-StrictMode`. Only empty folders were affected, so no files were missed — but update to clear the warnings. |
 | `Argument types do not match`, usually just after site resolution | Fixed. Some PowerShell builds miscompile `@( )` around a generic `List`, which is what the crawl used to build its site list. Update to the current version. |
 | `The certificate data cannot be read with the provided password` | Fixed — the password was stored under one name and read under another. Update to the current version; your existing certificate and `.pfx` still work, nothing needs re-issuing. |
 | Same error after updating | The `.secrets` folder is missing (not copied from the machine that ran setup, or deleted). Re-run setup option `2` for a fresh certificate. |

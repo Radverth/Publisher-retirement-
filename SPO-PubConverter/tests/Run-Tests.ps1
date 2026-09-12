@@ -19,6 +19,12 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# The modules run under Set-StrictMode -Version 2.0, so the tests must too.
+# Without it, $null.Count quietly returns 0 here while throwing "The property
+# 'Count' cannot be found on this object" inside a module - which is exactly
+# how an empty-collection bug reached a live tenant crawl.
+Set-StrictMode -Version 2.0
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $moduleRoot  = Join-Path $projectRoot 'modules'
 $tempRoot    = Join-Path ([System.IO.Path]::GetTempPath()) ('PubConverterTests_{0}' -f (Get-Date -Format 'yyyyMMddHHmmss'))
@@ -402,10 +408,29 @@ try {
     Assert-PubTest ($fromList.Count -eq 2)     'every item survives the conversion'
     Assert-PubTest ($fromList[1].n -eq 2)      'items keep their order and content'
 
-    Assert-PubTest ((ConvertTo-PubArray @(1, 2, 3)).Count -eq 3) 'an array passes through unchanged'
-    Assert-PubTest ((ConvertTo-PubArray $null).Count -eq 0)      'null becomes an empty array'
-    Assert-PubTest ((ConvertTo-PubArray 'one string').Count -eq 1) 'a string is one item, not a character array'
-    Assert-PubTest ((ConvertTo-PubArray ([pscustomobject] @{ n = 1 })).Count -eq 1) 'a single object becomes a one-item array'
+    # Every shape must come back as a real object[]. Returning an array from a
+    # PowerShell function unrolls it - an empty one becomes $null and a
+    # one-item one becomes the bare item - so each return is comma-wrapped.
+    # An empty page of Graph results hit exactly this and aborted the folder.
+    $shapes = [ordered] @{
+        'an array'            = @(1, 2, 3)
+        'an empty array'      = @()
+        'null'                = $null
+        'an empty List'       = (New-Object System.Collections.Generic.List[object])
+        'a one-item List'     = $listForArray[0]
+        'a string'            = 'one string'
+        'a single object'     = ([pscustomobject] @{ n = 1 })
+    }
+    $expectedCounts = [ordered] @{
+        'an array' = 3; 'an empty array' = 0; 'null' = 0; 'an empty List' = 0
+        'a one-item List' = 1; 'a string' = 1; 'a single object' = 1
+    }
+
+    foreach ($shapeName in $shapes.Keys) {
+        $converted = ConvertTo-PubArray $shapes[$shapeName]
+        Assert-PubTest ($converted -is [object[]]) ('{0} converts to a real object[]' -f $shapeName)
+        Assert-PubTest ($converted.Count -eq $expectedCounts[$shapeName]) ('{0} reports the right count' -f $shapeName)
+    }
 
     $sourceText = Get-Content -LiteralPath (Join-Path $moduleRoot 'Discovery.psm1') -Raw
     Assert-PubTest ($sourceText -notmatch '@\(\$sites\)') 'discovery no longer wraps its site List in @( )'
@@ -519,6 +544,11 @@ try {
                         parentReference = [pscustomobject] @{ id = 'root'; path = '/drives/drive1/root:' }
                     },
                     [pscustomobject] @{
+                        id = 'folderEmpty'; name = 'Empty Folder'
+                        folder = [pscustomobject] @{ childCount = 0 }
+                        parentReference = [pscustomobject] @{ id = 'root'; path = '/drives/drive1/root:' }
+                    },
+                    [pscustomobject] @{
                         id = 'file1'; name = 'Newsletter.pub'; size = 204800
                         file = [pscustomobject] @{ mimeType = 'application/x-mspublisher' }
                         lastModifiedDateTime = '2024-03-04T10:00:00Z'
@@ -533,6 +563,10 @@ try {
                         parentReference = [pscustomobject] @{ id = 'root'; path = '/drives/drive1/root:' }
                     }
                 )
+            }
+
+            if ($Uri -match 'drives/drive1/items/folderEmpty/children') {
+                return & $emit @()
             }
 
             if ($Uri -match 'drives/drive1/items/folderA/children') {
@@ -565,7 +599,7 @@ try {
 
     Assert-PubTest ($null -ne $newsletter) 'a file in the library root is found'
     Assert-PubTest ($null -ne $brochure)   'a file in a nested folder is found (recursion works)'
-    Assert-PubTest (($crawled | Where-Object { $_.FileName -like '*.docx' }).Count -eq 0) 'non-Publisher files are ignored'
+    Assert-PubTest ((ConvertTo-PubArray ($crawled | Where-Object { $_.FileName -like '*.docx' })).Count -eq 0) 'non-Publisher files are ignored'
 
     Assert-PubTest ($newsletter.FolderPath -eq '/')      'a root file records / as its folder'
     Assert-PubTest ($brochure.FolderPath -eq '/2024')    'a nested file records its folder path'
@@ -584,6 +618,11 @@ try {
 
     $onPageCalls = & $discoveryModule { $script:OnPageCalls }
     Assert-PubTest ($onPageCalls -gt 0) 'the crawl streams pages through the progress callback'
+
+    # An empty folder returns a page with no items. That used to throw inside
+    # the progress callback and get swallowed as "Skipped a folder".
+    $crawlLog = Get-Content -LiteralPath (Get-PubLogFile) -Raw
+    Assert-PubTest ($crawlLog -notmatch 'Skipped a folder') 'an empty folder is crawled cleanly, not skipped with a warning'
 
     Import-Module (Join-Path $moduleRoot 'Discovery.psm1') -Force -DisableNameChecking
 

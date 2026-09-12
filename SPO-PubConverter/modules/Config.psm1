@@ -49,16 +49,21 @@ function ConvertTo-PubArray {
         $InputObject
     )
 
-    if ($null -eq $InputObject)        { return @() }
-    if ($InputObject -is [object[]])   { return $InputObject }
+    # Every return is comma-wrapped. Returning an array from a PowerShell
+    # function otherwise unrolls it in the pipeline: an empty array comes back
+    # as $null and a one-item array as the bare item, so the caller's .Count
+    # either throws under Set-StrictMode or reports the wrong thing. The unary
+    # comma makes the array itself the single output.
+    if ($null -eq $InputObject)      { return ,@() }
+    if ($InputObject -is [object[]]) { return ,$InputObject }
 
     if (($InputObject -is [System.Collections.IEnumerable]) -and ($InputObject -isnot [string])) {
         $items = New-Object System.Collections.ArrayList
         foreach ($item in $InputObject) { [void] $items.Add($item) }
-        return $items.ToArray()
+        return ,$items.ToArray()
     }
 
-    return ,$InputObject
+    return ,@($InputObject)
 }
 
 function Test-PubIsWindows {

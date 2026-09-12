@@ -303,8 +303,11 @@ function Get-PubSiteList {
     $routeComplete    = $false
 
     if ($explicitUrls.Count -eq 0 -and (Test-PubPnPEnumerationEnabled -Config $Config)) {
-        $pnpUrls = Get-PubPnPSiteUrl -IncludePersonalSites:$IncludePersonalSites -Config $Config
-        if (@($pnpUrls).Count -gt 0) {
+        # ConvertTo-PubArray, not @( ): a function returning an empty array
+        # yields $null, and @($null) counts as one item - which would queue a
+        # null site URL and fail to resolve it.
+        $pnpUrls = ConvertTo-PubArray (Get-PubPnPSiteUrl -IncludePersonalSites:$IncludePersonalSites -Config $Config)
+        if ($pnpUrls.Count -gt 0) {
             foreach ($url in $pnpUrls) { $explicitUrls.Add($url) }
             $enumerationRoute = 'SharePoint tenant admin (PnP)'
             $routeComplete    = $true
@@ -706,12 +709,14 @@ function Invoke-PubDiscovery {
             continue
         }
 
+        $libraries    = ConvertTo-PubArray $libraries
         $libraryIndex = 0
+
         foreach ($library in $libraries) {
             $librariesCrawled++
             $libraryIndex++
 
-            $activity = 'Library {0} of {1}: {2}' -f $libraryIndex, @($libraries).Count, $library.DisplayName
+            $activity = 'Library {0} of {1}: {2}' -f $libraryIndex, $libraries.Count, $library.DisplayName
 
             try {
                 $files = Get-PubFileInLibrary -Site $site -Library $library `
@@ -730,7 +735,7 @@ function Invoke-PubDiscovery {
         $siteDuration = (Get-Date) - $siteStarted
         if ($siteDuration.TotalSeconds -ge 60) {
             Write-PubLog -Level Info -Message ('Site {0} of {1} took {2}: {3} ({4} librar(y/ies), {5} .pub found so far)' -f `
-                $siteIndex, $sites.Count, (Format-PubDuration -Duration $siteDuration), $site.webUrl, @($libraries).Count, $rows.Count)
+                $siteIndex, $sites.Count, (Format-PubDuration -Duration $siteDuration), $site.webUrl, $libraries.Count, $rows.Count)
         }
 
         # Save what has been found so far, so a long crawl that is interrupted
