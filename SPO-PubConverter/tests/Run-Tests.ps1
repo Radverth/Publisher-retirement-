@@ -387,6 +387,155 @@ try {
     Assert-PubTest ($result.Action -eq 'Convert' -and -not (Test-Path -LiteralPath $targetPdf)) 'existing PDF + Overwrite replaces it'
 
     # -----------------------------------------------------------------------
+    Write-PubTestSection 'Collections that might be a List'
+    # -----------------------------------------------------------------------
+    # @( ) around a System.Collections.Generic.List throws "Argument types do
+    # not match" on some PowerShell builds. It killed a real tenant crawl the
+    # moment site resolution finished, so collections of uncertain type go
+    # through ConvertTo-PubArray instead.
+    $listForArray = New-Object System.Collections.Generic.List[object]
+    $listForArray.Add([pscustomobject] @{ n = 1 })
+    $listForArray.Add([pscustomobject] @{ n = 2 })
+
+    $fromList = ConvertTo-PubArray $listForArray
+    Assert-PubTest ($fromList -is [object[]])  'a List converts to a plain array'
+    Assert-PubTest ($fromList.Count -eq 2)     'every item survives the conversion'
+    Assert-PubTest ($fromList[1].n -eq 2)      'items keep their order and content'
+
+    Assert-PubTest ((ConvertTo-PubArray @(1, 2, 3)).Count -eq 3) 'an array passes through unchanged'
+    Assert-PubTest ((ConvertTo-PubArray $null).Count -eq 0)      'null becomes an empty array'
+    Assert-PubTest ((ConvertTo-PubArray 'one string').Count -eq 1) 'a string is one item, not a character array'
+    Assert-PubTest ((ConvertTo-PubArray ([pscustomobject] @{ n = 1 })).Count -eq 1) 'a single object becomes a one-item array'
+
+    $sourceText = Get-Content -LiteralPath (Join-Path $moduleRoot 'Discovery.psm1') -Raw
+    Assert-PubTest ($sourceText -notmatch '@\(\$sites\)') 'discovery no longer wraps its site List in @( )'
+
+    # -----------------------------------------------------------------------
+    Write-PubTestSection 'Discovery crawl, end to end with Graph stubbed'
+    # -----------------------------------------------------------------------
+    # Exercises the whole crawl offline: site resolution, library filtering,
+    # recursion into folders, extension matching and row construction. This is
+    # the path that a tenant-wide scan actually runs.
+    $discoveryModule = Get-Module Discovery
+    & $discoveryModule {
+        function script:Connect-PubGraphApp { param($Config, [switch] $Force) return $true }
+        function script:Test-PubPnPEnumerationEnabled { param($Config) return $false }
+
+        function script:Invoke-PubGraph {
+            param([string] $Uri, [string] $Method = 'GET', $Body, [hashtable] $Headers, [string] $ContentType, [string] $OutputFilePath, [int] $MaxAttempts = 5)
+            if ($Uri -match '^sites/[^/]+:') {
+                return [pscustomobject] @{
+                    id = 'contoso.sharepoint.com,aaa,bbb'; webUrl = 'https://contoso.sharepoint.com/sites/Marketing'
+                    displayName = 'Marketing'; name = 'Marketing'
+                }
+            }
+            throw "unexpected Invoke-PubGraph call: $Uri"
+        }
+
+        function script:Get-PubGraphAll {
+            param([string] $Uri, [int] $MaxItems = 0, [int] $MaxAttempts = 5)
+
+            if ($Uri -match '/sites\?\$select') { return @() }
+
+            if ($Uri -match '/lists\?') {
+                return @(
+                    [pscustomobject] @{
+                        id = 'list1'; name = 'Shared Documents'; displayName = 'Documents'
+                        list = [pscustomobject] @{ template = 'documentLibrary'; hidden = $false }
+                        drive = [pscustomobject] @{ id = 'drive1'; name = 'Documents' }
+                    },
+                    [pscustomobject] @{
+                        id = 'list2'; name = 'Hidden'; displayName = 'Hidden Library'
+                        list = [pscustomobject] @{ template = 'documentLibrary'; hidden = $true }
+                        drive = [pscustomobject] @{ id = 'drive2'; name = 'Hidden' }
+                    },
+                    [pscustomobject] @{
+                        id = 'list3'; name = 'Style Library'; displayName = 'Style Library'
+                        list = [pscustomobject] @{ template = 'documentLibrary'; hidden = $false }
+                        drive = [pscustomobject] @{ id = 'drive3'; name = 'Style Library' }
+                    },
+                    [pscustomobject] @{
+                        id = 'list4'; name = 'Site Pages'; displayName = 'Site Pages'
+                        list = [pscustomobject] @{ template = 'sitePagePublishing'; hidden = $false }
+                        drive = [pscustomobject] @{ id = 'drive4'; name = 'Site Pages' }
+                    }
+                )
+            }
+
+            if ($Uri -match 'drives/drive1/root/children') {
+                return @(
+                    [pscustomobject] @{
+                        id = 'folderA'; name = '2024'
+                        folder = [pscustomobject] @{ childCount = 2 }
+                        parentReference = [pscustomobject] @{ id = 'root'; path = '/drives/drive1/root:' }
+                    },
+                    [pscustomobject] @{
+                        id = 'file1'; name = 'Newsletter.pub'; size = 204800
+                        file = [pscustomobject] @{ mimeType = 'application/x-mspublisher' }
+                        lastModifiedDateTime = '2024-03-04T10:00:00Z'
+                        lastModifiedBy = [pscustomobject] @{ user = [pscustomobject] @{ email = 'tom@contoso.com'; displayName = 'Tom' } }
+                        parentReference = [pscustomobject] @{ id = 'root'; path = '/drives/drive1/root:' }
+                        sharepointIds = [pscustomobject] @{ listItemUniqueId = '11111111-2222-3333-4444-555555555555' }
+                    },
+                    [pscustomobject] @{
+                        id = 'file3'; name = 'NotPublisher.docx'; size = 1000
+                        file = [pscustomobject] @{ mimeType = 'application/vnd.openxmlformats' }
+                        lastModifiedDateTime = '2024-03-04T10:00:00Z'
+                        parentReference = [pscustomobject] @{ id = 'root'; path = '/drives/drive1/root:' }
+                    }
+                )
+            }
+
+            if ($Uri -match 'drives/drive1/items/folderA/children') {
+                return @(
+                    [pscustomobject] @{
+                        id = 'file2'; name = 'Brochure.pub'; size = 1048576
+                        file = [pscustomobject] @{ mimeType = 'application/x-mspublisher' }
+                        lastModifiedDateTime = '2024-05-06T09:00:00Z'
+                        lastModifiedBy = [pscustomobject] @{ user = [pscustomobject] @{ displayName = 'Jo' } }
+                        parentReference = [pscustomobject] @{ id = 'folderA'; path = '/drives/drive1/root:/2024' }
+                        sharepointIds = [pscustomobject] @{ listItemUniqueId = '66666666-7777-8888-9999-000000000000' }
+                    }
+                )
+            }
+
+            throw "unexpected Get-PubGraphAll call: $Uri"
+        }
+    }
+
+    $crawlConfig = New-PubDefaultConfig
+    $crawlConfig['DefaultWorkingFolder'] = Join-Path $tempRoot 'crawl'
+
+    $crawled = Invoke-PubDiscovery -SiteUrl @('https://contoso.sharepoint.com/sites/Marketing') -Config $crawlConfig
+    $crawled = ConvertTo-PubArray $crawled
+
+    Assert-PubTest ($crawled.Count -eq 2) 'the crawl completes and returns only the .pub files'
+
+    $newsletter = $crawled | Where-Object { $_.FileName -eq 'Newsletter.pub' } | Select-Object -First 1
+    $brochure   = $crawled | Where-Object { $_.FileName -eq 'Brochure.pub' }   | Select-Object -First 1
+
+    Assert-PubTest ($null -ne $newsletter) 'a file in the library root is found'
+    Assert-PubTest ($null -ne $brochure)   'a file in a nested folder is found (recursion works)'
+    Assert-PubTest (($crawled | Where-Object { $_.FileName -like '*.docx' }).Count -eq 0) 'non-Publisher files are ignored'
+
+    Assert-PubTest ($newsletter.FolderPath -eq '/')      'a root file records / as its folder'
+    Assert-PubTest ($brochure.FolderPath -eq '/2024')    'a nested file records its folder path'
+    Assert-PubTest ($newsletter.LibraryName -eq 'Documents') 'the library display name is recorded'
+    Assert-PubTest ($newsletter.FileSizeKB -eq 200)      'size is recorded in KB'
+    Assert-PubTest ($newsletter.ModifiedBy -eq 'tom@contoso.com') 'modified-by prefers the UPN'
+    Assert-PubTest ($brochure.ModifiedBy -eq 'Jo')       'modified-by falls back to the display name'
+    Assert-PubTest ($newsletter.UniqueId -eq '11111111-2222-3333-4444-555555555555') 'the SharePoint file GUID is the join key'
+    Assert-PubTest ($newsletter.Status -eq 'Pending')    'new rows start Pending'
+    Assert-PubTest ($newsletter.DriveId -eq 'drive1' -and $newsletter.ItemId -eq 'file1') 'the drive and item ids needed for download are recorded'
+    Assert-PubTest ($newsletter.SiteUrl -eq 'https://contoso.sharepoint.com/sites/Marketing') 'the site URL is recorded'
+
+    # Hidden, system and non-library lists must never be crawled - the stub
+    # throws on any unexpected drive, so reaching here proves they were skipped.
+    Assert-PubTest $true 'hidden, system and non-document-library lists are skipped'
+
+    Import-Module (Join-Path $moduleRoot 'Discovery.psm1') -Force -DisableNameChecking
+
+    # -----------------------------------------------------------------------
     Write-PubTestSection 'Console menu (brief section 7)'
     # -----------------------------------------------------------------------
     # Load the menu's functions without going interactive.

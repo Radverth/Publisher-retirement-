@@ -27,6 +27,40 @@ $script:ProjectRoot = Split-Path -Parent $PSScriptRoot
 $script:ConfigPath  = Join-Path $script:ProjectRoot 'config.json'
 $script:VaultName   = 'SPO-PubConverter'
 
+function ConvertTo-PubArray {
+    <#
+    .SYNOPSIS
+        Converts any collection to a plain object[], safely.
+
+    .DESCRIPTION
+        Wrapping a System.Collections.Generic.List in the array subexpression
+        @( ) throws "Argument types do not match" on some PowerShell builds -
+        a runtime code-generation defect rather than anything wrong with the
+        script. It bites at run time, on the host the tool is deployed to,
+        which is the worst place to find it, so collections that might be a
+        List go through here instead of @( ).
+
+    .EXAMPLE
+        $rows = ConvertTo-PubArray $Rows
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        $InputObject
+    )
+
+    if ($null -eq $InputObject)        { return @() }
+    if ($InputObject -is [object[]])   { return $InputObject }
+
+    if (($InputObject -is [System.Collections.IEnumerable]) -and ($InputObject -isnot [string])) {
+        $items = New-Object System.Collections.ArrayList
+        foreach ($item in $InputObject) { [void] $items.Add($item) }
+        return $items.ToArray()
+    }
+
+    return ,$InputObject
+}
+
 function Test-PubIsWindows {
     <#
     .SYNOPSIS
@@ -446,6 +480,7 @@ function Get-PubSecret {
 }
 
 Export-ModuleMember -Function @(
+    'ConvertTo-PubArray'
     'Test-PubIsWindows'
     'Get-PubProjectRoot'
     'Get-PubConfigPath'

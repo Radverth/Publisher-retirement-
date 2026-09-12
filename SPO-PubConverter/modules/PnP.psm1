@@ -268,7 +268,7 @@ function Get-PubPnPSiteUrl {
     $urls    = New-Object System.Collections.Generic.List[string]
     $skipped = 0
 
-    foreach ($site in @($sites)) {
+    foreach ($site in $sites) {
         if (-not $site.PSObject.Properties['Url'] -or [string]::IsNullOrWhiteSpace($site.Url)) { continue }
 
         $template = ''

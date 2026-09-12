@@ -337,8 +337,8 @@ function Get-PubSiteList {
                 $graphUri = "sites/{0}:{1}" -f $parsed.Host, $sitePath
                 if ([string]::IsNullOrWhiteSpace($sitePath)) { $graphUri = "sites/{0}" -f $parsed.Host }
 
-                $site = Invoke-PubGraph -Uri ("{0}?`$select=id,webUrl,displayName,name" -f $graphUri) -Method GET
-                if ($site -and $seen.Add($site.id)) { $sites.Add($site) }
+                $resolvedSite = Invoke-PubGraph -Uri ("{0}?`$select=id,webUrl,displayName,name" -f $graphUri) -Method GET
+                if ($resolvedSite -and $seen.Add($resolvedSite.id)) { $sites.Add($resolvedSite) }
             } catch {
                 $failed++
                 Write-PubLog -Level Error -Message ('Could not resolve site {0}: {1}' -f $url, (Get-PubGraphErrorMessage -ErrorRecord $_))
@@ -371,14 +371,14 @@ function Get-PubSiteList {
         }
 
         $personalSkipped = 0
-        foreach ($site in $enumeration.Sites) {
-            if (-not $site.PSObject.Properties['webUrl'] -or -not $site.webUrl) { continue }
+        foreach ($enumeratedSite in $enumeration.Sites) {
+            if (-not $enumeratedSite.PSObject.Properties['webUrl'] -or -not $enumeratedSite.webUrl) { continue }
 
-            if ($site.webUrl -match '-my\.sharepoint\.com') {
+            if ($enumeratedSite.webUrl -match '-my\.sharepoint\.com') {
                 if (-not $IncludePersonalSites) { $personalSkipped++; continue }
             }
 
-            if ($seen.Add($site.id)) { $sites.Add($site) }
+            if ($seen.Add($enumeratedSite.id)) { $sites.Add($enumeratedSite) }
         }
 
         if ($personalSkipped -gt 0) {
@@ -387,16 +387,22 @@ function Get-PubSiteList {
     }
 
     # Pull in subsites, which site search does not always return.
-    $topLevel = @($sites)
-    foreach ($site in $topLevel) {
+    #
+    # NOTE: the loop variable here is deliberately NOT $site. PowerShell binds a
+    # variable's type per scope when it compiles a function, and $site is
+    # already used for a hand-assigned Graph result and for another foreach
+    # above. Reusing it a third time makes the compiler throw "Argument types do
+    # not match" before the loop body ever runs.
+    $topLevel = $sites.ToArray()
+    foreach ($parentSite in $topLevel) {
         try {
-            $subSites = Get-PubGraphAll -Uri ("sites/{0}/sites?`$select=id,webUrl,displayName,name" -f $site.id)
-            foreach ($subSite in $subSites) {
-                if (-not $subSite.PSObject.Properties['webUrl'] -or -not $subSite.webUrl) { continue }
-                if ($seen.Add($subSite.id)) { $sites.Add($subSite) }
+            $subSites = Get-PubGraphAll -Uri ("sites/{0}/sites?`$select=id,webUrl,displayName,name" -f $parentSite.id)
+            foreach ($childSite in $subSites) {
+                if (-not $childSite.PSObject.Properties['webUrl'] -or -not $childSite.webUrl) { continue }
+                if ($seen.Add($childSite.id)) { $sites.Add($childSite) }
             }
         } catch {
-            Write-PubLog -Level Debug -Message ('No subsites read for {0}: {1}' -f $site.webUrl, (Get-PubGraphErrorMessage -ErrorRecord $_))
+            Write-PubLog -Level Debug -Message ('No subsites read for {0}: {1}' -f $parentSite.webUrl, (Get-PubGraphErrorMessage -ErrorRecord $_))
         }
     }
 
@@ -701,13 +707,13 @@ function Export-PubInventory {
     $columns = Get-PubInventoryColumns
 
     try {
-        @($Rows) | Select-Object $columns | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        (ConvertTo-PubArray $Rows) | Select-Object $columns | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
     } catch {
         Write-PubLog -Level Error -Message ('Could not write the CSV to {0}: {1}' -f $Path, $_.Exception.Message)
         return $null
     }
 
-    Write-PubLog -Level Success -Message ('Inventory written: {0} ({1} rows)' -f $Path, @($Rows).Count)
+    Write-PubLog -Level Success -Message ('Inventory written: {0} ({1} rows)' -f $Path, (ConvertTo-PubArray $Rows).Count)
 
     if (-not $NoConfigUpdate) {
         $Config['LastInventoryCsv'] = $Path
@@ -818,8 +824,10 @@ function Get-PubInventoryStatistic {
         $Rows
     )
 
+    $rows = ConvertTo-PubArray $Rows
+
     $statistics = [ordered] @{
-        Total      = @($Rows).Count
+        Total      = $rows.Count
         Pending    = 0
         Downloaded = 0
         Converted  = 0
@@ -828,7 +836,7 @@ function Get-PubInventoryStatistic {
         Skipped    = 0
     }
 
-    foreach ($row in @($Rows)) {
+    foreach ($row in $rows) {
         $status = [string] $row.Status
         if ([string]::IsNullOrWhiteSpace($status)) { $status = 'Pending' }
         if ($statistics.Contains($status)) { $statistics[$status] = $statistics[$status] + 1 }

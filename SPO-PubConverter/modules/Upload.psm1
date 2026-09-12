@@ -207,7 +207,7 @@ function Invoke-PubUpload {
         if ([string]::IsNullOrWhiteSpace($ConflictAction)) { $ConflictAction = 'Version' }
     }
 
-    $rows = @($Rows)
+    $rows = ConvertTo-PubArray $Rows
 
     $eligible = New-Object System.Collections.Generic.List[object]
     foreach ($row in $rows) {

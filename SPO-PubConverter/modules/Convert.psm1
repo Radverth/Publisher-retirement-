@@ -230,7 +230,7 @@ function Select-PubInventoryRow {
         [string[]] $Status
     )
 
-    $selected = @($Rows)
+    $selected = ConvertTo-PubArray $Rows
 
     if (-not [string]::IsNullOrWhiteSpace($SiteFilter)) {
         $selected = @($selected | Where-Object { [string] $_.SiteUrl -like $SiteFilter })
@@ -273,7 +273,7 @@ function Invoke-PubDownload {
 
     if (-not $Config) { $Config = Get-PubConfig }
 
-    $rows = @($Rows)
+    $rows = ConvertTo-PubArray $Rows
     if ($rows.Count -eq 0) {
         Write-PubLog -Level Warn -Message 'No rows selected - nothing to download.'
         return $rows
@@ -365,7 +365,7 @@ function Invoke-PubConvertBatch {
         [int] $PerFileTimeoutSeconds = 300
     )
 
-    $jobs = @($Jobs)
+    $jobs = ConvertTo-PubArray $Jobs
     if ($jobs.Count -eq 0) { return @() }
 
     $temp       = Get-PubWorkingFolder -SubFolder 'converted'
@@ -458,7 +458,7 @@ function Invoke-PubConvert {
         if ([string]::IsNullOrWhiteSpace($ExistingPdfAction)) { $ExistingPdfAction = 'Version' }
     }
 
-    $rows = @($Rows)
+    $rows = ConvertTo-PubArray $Rows
     if ($rows.Count -eq 0) {
         Write-PubLog -Level Warn -Message 'No rows selected - nothing to convert.'
         return $rows
