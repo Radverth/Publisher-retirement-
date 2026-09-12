@@ -497,7 +497,11 @@ function Get-PubFileInLibrary {
     param(
         [Parameter(Mandatory)] $Site,
         [Parameter(Mandatory)] $Library,
-        [scriptblock] $OnFileFound
+        [scriptblock] $OnFileFound,
+
+        [int]    $ProgressId = 0,
+        [int]    $ParentProgressId = 1,
+        [string] $ProgressActivity
     )
 
     $found  = New-Object System.Collections.Generic.List[object]
@@ -505,6 +509,29 @@ function Get-PubFileInLibrary {
 
     $folderStack = New-Object System.Collections.Stack
     $folderStack.Push('root')
+
+    # Counters live in a hashtable, not in plain variables: the page callback
+    # below is invoked with & from Get-PubGraphAll, which gives it its own
+    # scope, and assigning to an outer scalar from there would silently update
+    # a local copy while the real counter stayed at zero. Mutating a member of
+    # a shared hashtable is the same object in both scopes.
+    $counters = @{ Folders = 0; Items = 0; Path = '/' }
+
+    # A big library is hundreds of sequential requests. Without an update per
+    # page the whole site looks frozen, which is exactly how this reads to an
+    # operator watching the console.
+    $reportProgress = {
+        param([string] $Operation)
+
+        if ($ProgressId -le 0) { return }
+
+        Write-Progress -Id $ProgressId -ParentId $ParentProgressId `
+                       -Activity $ProgressActivity `
+                       -Status ('{0} folder(s) read | {1} item(s) seen | {2} .pub found | {3} folder(s) queued' -f $counters.Folders, $counters.Items, $found.Count, $folderStack.Count) `
+                       -CurrentOperation $Operation
+    }
+
+    & $reportProgress 'starting'
 
     while ($folderStack.Count -gt 0) {
         $folderId = $folderStack.Pop()
@@ -514,18 +541,34 @@ function Get-PubFileInLibrary {
             $uri = "drives/{0}/root/children?`$select={1}&`$top=200" -f $Library.DriveId, $select
         }
 
+        $onPage = {
+            param($PageItems, $PageNumber, $ItemsSoFar)
+
+            $counters.Items = $counters.Items + (ConvertTo-PubArray $PageItems).Count
+
+            $suffix = ''
+            if ($PageNumber -gt 1) { $suffix = (' (page {0})' -f $PageNumber) }
+            & $reportProgress ('{0}{1}' -f $counters.Path, $suffix)
+        }
+
         $children = @()
         try {
-            $children = Get-PubGraphAll -Uri $uri
+            $children = Get-PubGraphAll -Uri $uri -OnPage $onPage
         } catch {
             Write-PubLog -Level Warn -Message ('Skipped a folder in {0} / {1}: {2}' -f $Site.webUrl, $Library.DisplayName, (Get-PubGraphErrorMessage -ErrorRecord $_))
             continue
         }
 
+        $counters.Folders = $counters.Folders + 1
+
         foreach ($item in $children) {
             if ($item.PSObject.Properties['folder'] -and $item.folder) {
                 $folderStack.Push($item.id)
                 continue
+            }
+
+            if ($item.PSObject.Properties['parentReference'] -and $item.parentReference) {
+                $counters.Path = Get-PubDriveFolderPath -ParentReference $item.parentReference
             }
 
             if (-not $item.PSObject.Properties['file'] -or -not $item.file) { continue }
@@ -576,6 +619,12 @@ function Get-PubFileInLibrary {
             $found.Add($row)
             if ($OnFileFound) { & $OnFileFound $row }
         }
+
+        & $reportProgress $counters.Path
+    }
+
+    if ($ProgressId -gt 0) {
+        Write-Progress -Id $ProgressId -ParentId $ParentProgressId -Activity $ProgressActivity -Completed
     }
 
     return $found.ToArray()
@@ -592,6 +641,10 @@ function Invoke-PubDiscovery {
     .PARAMETER SiteUrl
         Optional explicit site URLs to restrict the scan.
 
+    .PARAMETER AutoSaveEvery
+        Write a partial CSV every N sites so a long crawl that is interrupted
+        keeps what it has already found. 0 disables it.
+
     .OUTPUTS
         The inventory rows found, ready for Export-PubInventory.
     #>
@@ -600,7 +653,9 @@ function Invoke-PubDiscovery {
         [string]   $ScopePath,
         [string[]] $SiteUrl,
         [switch]   $IncludePersonalSites,
-        $Config
+        $Config,
+
+        [int] $AutoSaveEvery = 10
     )
 
     if (-not $Config) { $Config = Get-PubConfig }
@@ -620,13 +675,26 @@ function Invoke-PubDiscovery {
     $siteIndex       = 0
     $sitesFailed     = 0
     $librariesCrawled = 0
+    $partialCsvPath  = ''
 
     foreach ($site in $sites) {
         $siteIndex++
+        $siteStarted = Get-Date
 
+        $elapsed = (Get-Date) - $started
         $percent = [int] (($siteIndex / $sites.Count) * 100)
-        Write-Progress -Activity 'Scanning SharePoint for .pub files' `
-                       -Status ('Site {0} of {1} - {2} found so far' -f $siteIndex, $sites.Count, $rows.Count) `
+
+        # An estimate is only meaningful once a couple of sites have finished,
+        # and sites vary wildly in size, so it is explicitly a rough figure.
+        $remainingText = ''
+        if ($siteIndex -gt 2) {
+            $perSite   = $elapsed.TotalSeconds / ($siteIndex - 1)
+            $remaining = [timespan]::FromSeconds($perSite * ($sites.Count - $siteIndex + 1))
+            $remainingText = ' | about {0} left' -f (Format-PubDuration -Duration $remaining)
+        }
+
+        Write-Progress -Id 1 -Activity 'Scanning SharePoint for .pub files' `
+                       -Status ('Site {0} of {1} | {2} .pub found | {3} elapsed{4}' -f $siteIndex, $sites.Count, $rows.Count, (Format-PubDuration -Duration $elapsed), $remainingText) `
                        -CurrentOperation $site.webUrl `
                        -PercentComplete $percent
 
@@ -638,10 +706,16 @@ function Invoke-PubDiscovery {
             continue
         }
 
+        $libraryIndex = 0
         foreach ($library in $libraries) {
             $librariesCrawled++
+            $libraryIndex++
+
+            $activity = 'Library {0} of {1}: {2}' -f $libraryIndex, @($libraries).Count, $library.DisplayName
+
             try {
-                $files = Get-PubFileInLibrary -Site $site -Library $library
+                $files = Get-PubFileInLibrary -Site $site -Library $library `
+                                              -ProgressId 2 -ParentProgressId 1 -ProgressActivity $activity
                 foreach ($file in $files) {
                     $rows.Add($file)
                     Write-PubFileResult -Outcome Found -FileName $file.FileName -Detail ('{0} / {1}{2}' -f $site.webUrl, $library.DisplayName, $file.FolderPath)
@@ -650,9 +724,30 @@ function Invoke-PubDiscovery {
                 Write-PubLog -Level Error -Message ('Library failed: {0} / {1} - {2}' -f $site.webUrl, $library.DisplayName, (Get-PubGraphErrorMessage -ErrorRecord $_))
             }
         }
+
+        # A site big enough to look like a hang gets a line in the log saying
+        # how long it actually took, so slow sites can be identified afterwards.
+        $siteDuration = (Get-Date) - $siteStarted
+        if ($siteDuration.TotalSeconds -ge 60) {
+            Write-PubLog -Level Info -Message ('Site {0} of {1} took {2}: {3} ({4} librar(y/ies), {5} .pub found so far)' -f `
+                $siteIndex, $sites.Count, (Format-PubDuration -Duration $siteDuration), $site.webUrl, @($libraries).Count, $rows.Count)
+        }
+
+        # Save what has been found so far, so a long crawl that is interrupted
+        # is not lost - the partial CSV can be loaded with menu option 6.
+        if ($AutoSaveEvery -gt 0 -and $rows.Count -gt 0 -and ($siteIndex % $AutoSaveEvery) -eq 0 -and $siteIndex -lt $sites.Count) {
+            if ([string]::IsNullOrWhiteSpace($partialCsvPath)) {
+                $inventoryFolder = Get-PubWorkingFolder -SubFolder 'inventory' -Config $Config
+                $partialCsvPath  = Join-Path $inventoryFolder ('PublisherFileInventory_{0}_partial.csv' -f (Get-Date -Format 'yyyy-MM-dd_HHmm'))
+            }
+
+            Export-PubInventory -Rows $rows.ToArray() -Path $partialCsvPath -Config $Config -NoConfigUpdate | Out-Null
+            Write-PubLog -Level Info -Message ('Progress saved after {0} site(s): {1}' -f $siteIndex, $partialCsvPath)
+        }
     }
 
-    Write-Progress -Activity 'Scanning SharePoint for .pub files' -Completed
+    Write-Progress -Id 2 -Activity 'Library' -Completed
+    Write-Progress -Id 1 -Activity 'Scanning SharePoint for .pub files' -Completed
 
     $elapsed = (Get-Date) - $started
     $scopeLabel = 'every site the app can enumerate'
@@ -671,6 +766,7 @@ function Invoke-PubDiscovery {
                               ('OneDrive sites    : {0}' -f $oneDriveLabel)
                               ('Libraries crawled : {0}' -f $librariesCrawled)
                               ('Publisher files   : {0}' -f $rows.Count)
+                              $(if ($partialCsvPath) { 'Partial saves     : {0}' -f $partialCsvPath } else { '' })
                               ('Elapsed           : {0:hh\:mm\:ss}' -f $elapsed)
                           )
 

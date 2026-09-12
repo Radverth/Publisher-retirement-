@@ -411,12 +411,51 @@ try {
     Assert-PubTest ($sourceText -notmatch '@\(\$sites\)') 'discovery no longer wraps its site List in @( )'
 
     # -----------------------------------------------------------------------
+    Write-PubTestSection 'Graph paging and the progress callback'
+    # -----------------------------------------------------------------------
+    # The callback is defined in Discovery and invoked from Graph, so this
+    # covers the real cross-module path, including whether a counter mutated
+    # inside the callback survives (it must be a hashtable member - assigning
+    # to an outer scalar from an & invocation silently updates a local copy).
+    $graphModule = Get-Module Graph
+    & $graphModule {
+        function script:Invoke-PubGraph {
+            param([string] $Uri, [string] $Method = 'GET', $Body, [hashtable] $Headers, [string] $ContentType, [string] $OutputFilePath, [int] $MaxAttempts = 5)
+            if ($Uri -eq 'page1') {
+                return [pscustomobject] @{ value = @('a', 'b', 'c'); '@odata.nextLink' = 'page2' }
+            }
+            return [pscustomobject] @{ value = @('d', 'e') }
+        }
+    }
+
+    $pageCounter = @{ Pages = 0; Items = 0; LastSoFar = 0 }
+    $pageCallback = {
+        param($PageItems, $PageNumber, $ItemsSoFar)
+        $pageCounter.Pages     = $pageCounter.Pages + 1
+        $pageCounter.Items     = $pageCounter.Items + (ConvertTo-PubArray $PageItems).Count
+        $pageCounter.LastSoFar = $ItemsSoFar
+    }
+
+    $paged = Get-PubGraphAll -Uri 'page1' -OnPage $pageCallback
+
+    Assert-PubTest ((ConvertTo-PubArray $paged).Count -eq 5) 'paging follows @odata.nextLink to the end'
+    Assert-PubTest ($pageCounter.Pages -eq 2)               'the callback fires once per page'
+    Assert-PubTest ($pageCounter.Items -eq 5)               'a counter mutated inside the callback really accumulates'
+    Assert-PubTest ($pageCounter.LastSoFar -eq 5)           'the callback is told the running total'
+
+    $withoutCallback = Get-PubGraphAll -Uri 'page1'
+    Assert-PubTest ((ConvertTo-PubArray $withoutCallback).Count -eq 5) 'paging still works with no callback supplied'
+
+    Import-Module (Join-Path $moduleRoot 'Graph.psm1') -Force -DisableNameChecking
+
+    # -----------------------------------------------------------------------
     Write-PubTestSection 'Discovery crawl, end to end with Graph stubbed'
     # -----------------------------------------------------------------------
     # Exercises the whole crawl offline: site resolution, library filtering,
     # recursion into folders, extension matching and row construction. This is
     # the path that a tenant-wide scan actually runs.
     $discoveryModule = Get-Module Discovery
+    & $discoveryModule { $script:OnPageCalls = 0 }
     & $discoveryModule {
         function script:Connect-PubGraphApp { param($Config, [switch] $Force) return $true }
         function script:Test-PubPnPEnumerationEnabled { param($Config) return $false }
@@ -433,12 +472,22 @@ try {
         }
 
         function script:Get-PubGraphAll {
-            param([string] $Uri, [int] $MaxItems = 0, [int] $MaxAttempts = 5)
+            [CmdletBinding()]
+            param([string] $Uri, [int] $MaxItems = 0, [int] $MaxAttempts = 5, [scriptblock] $OnPage)
+
+            # Mirror the real paging contract: hand each page to the callback so
+            # the progress path is exercised, not just the happy return value.
+            $emit = {
+                param($Items)
+                $script:OnPageCalls = $script:OnPageCalls + 1
+                if ($OnPage) { & $OnPage (ConvertTo-PubArray $Items) 1 (ConvertTo-PubArray $Items).Count }
+                return $Items
+            }
 
             if ($Uri -match '/sites\?\$select') { return @() }
 
             if ($Uri -match '/lists\?') {
-                return @(
+                return & $emit @(
                     [pscustomobject] @{
                         id = 'list1'; name = 'Shared Documents'; displayName = 'Documents'
                         list = [pscustomobject] @{ template = 'documentLibrary'; hidden = $false }
@@ -463,7 +512,7 @@ try {
             }
 
             if ($Uri -match 'drives/drive1/root/children') {
-                return @(
+                return & $emit @(
                     [pscustomobject] @{
                         id = 'folderA'; name = '2024'
                         folder = [pscustomobject] @{ childCount = 2 }
@@ -487,7 +536,7 @@ try {
             }
 
             if ($Uri -match 'drives/drive1/items/folderA/children') {
-                return @(
+                return & $emit @(
                     [pscustomobject] @{
                         id = 'file2'; name = 'Brochure.pub'; size = 1048576
                         file = [pscustomobject] @{ mimeType = 'application/x-mspublisher' }
@@ -532,6 +581,9 @@ try {
     # Hidden, system and non-library lists must never be crawled - the stub
     # throws on any unexpected drive, so reaching here proves they were skipped.
     Assert-PubTest $true 'hidden, system and non-document-library lists are skipped'
+
+    $onPageCalls = & $discoveryModule { $script:OnPageCalls }
+    Assert-PubTest ($onPageCalls -gt 0) 'the crawl streams pages through the progress callback'
 
     Import-Module (Join-Path $moduleRoot 'Discovery.psm1') -Force -DisableNameChecking
 
@@ -710,6 +762,11 @@ try {
     # -----------------------------------------------------------------------
     Write-PubFileResult -Outcome Converted -FileName 'Newsletter.pub' -Detail 'Newsletter.pdf'
     Write-PubPhaseSummary -Phase 'Test' -Attempted 3 -Succeeded 2 -Failed 1
+
+    Assert-PubTest ((Format-PubDuration -Duration ([timespan]::FromSeconds(0.4))) -eq 'less than a second') 'a sub-second duration reads plainly'
+    Assert-PubTest ((Format-PubDuration -Duration ([timespan]::FromSeconds(45))) -eq '45s')                 'seconds are shown on their own'
+    Assert-PubTest ((Format-PubDuration -Duration ([timespan]::FromSeconds(252))) -eq '4m 12s')             'minutes and seconds are shown together'
+    Assert-PubTest ((Format-PubDuration -Duration ([timespan]::FromMinutes(83))) -eq '1h 23m')              'long runs are shown in hours and minutes'
 
     $logContent = Get-Content -LiteralPath (Get-PubLogFile) -Raw
     Assert-PubTest ($logContent -match 'CONVERTED \| Newsletter\.pub') 'one summary line per file is logged'

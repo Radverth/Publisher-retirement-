@@ -439,7 +439,19 @@ function Invoke-PubGraph {
             if ($status -eq 429) { $reason = 'throttled (HTTP 429)' }
 
             Write-PubLog -Level Warn -Message ('Graph {0} - waiting {1}s then retrying (attempt {2}/{3}).' -f $reason, [int] $wait, $attempt, $MaxAttempts)
-            Start-Sleep -Seconds ([int] $wait)
+
+            # Show the wait counting down, so a throttled run does not look
+            # like a hang - this is the single most common reason a tenant-wide
+            # crawl appears to stop dead.
+            $remaining = [int] $wait
+            while ($remaining -gt 0) {
+                Write-Progress -Id 9 -Activity 'Microsoft Graph is throttling this app' `
+                               -Status ('Waiting {0}s before retry {1} of {2}' -f $remaining, $attempt, $MaxAttempts) `
+                               -PercentComplete ([int] ((([int] $wait - $remaining) / [math]::Max([int] $wait, 1)) * 100))
+                Start-Sleep -Seconds 1
+                $remaining--
+            }
+            Write-Progress -Id 9 -Activity 'Microsoft Graph is throttling this app' -Completed
         }
     }
 }
@@ -451,27 +463,45 @@ function Get-PubGraphAll {
 
     .PARAMETER MaxItems
         Stop after this many items (0 = no limit). Useful for test runs.
+
+    .PARAMETER OnPage
+        Called with each page of results as it arrives, as
+        & $OnPage $itemsInThisPage $pageNumber $itemsSoFar. Used so a caller can
+        report progress while a large library is being paged through, instead
+        of going silent for hundreds of sequential requests.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string] $Uri,
         [int] $MaxItems = 0,
-        [int] $MaxAttempts = 5
+        [int] $MaxAttempts = 5,
+        [scriptblock] $OnPage
     )
 
     $results = New-Object System.Collections.Generic.List[object]
     $next    = $Uri
+    $page    = 0
 
     while ($next) {
         $response = Invoke-PubGraph -Uri $next -Method GET -MaxAttempts $MaxAttempts
+        $page++
 
         if ($response -and $response.PSObject.Properties['value'] -and $null -ne $response.value) {
+            $pageItems = New-Object System.Collections.Generic.List[object]
+
             foreach ($item in $response.value) {
                 $results.Add($item)
-                if ($MaxItems -gt 0 -and $results.Count -ge $MaxItems) { return $results.ToArray() }
+                $pageItems.Add($item)
+                if ($MaxItems -gt 0 -and $results.Count -ge $MaxItems) {
+                    if ($OnPage) { & $OnPage $pageItems.ToArray() $page $results.Count }
+                    return $results.ToArray()
+                }
             }
+
+            if ($OnPage) { & $OnPage $pageItems.ToArray() $page $results.Count }
         } elseif ($response) {
             $results.Add($response)
+            if ($OnPage) { & $OnPage @($response) $page $results.Count }
         }
 
         $next = $null

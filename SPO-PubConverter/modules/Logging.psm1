@@ -169,6 +169,22 @@ function Write-PubLog {
     }
 }
 
+function Format-PubDuration {
+    <#
+    .SYNOPSIS
+        Formats a TimeSpan for progress lines: 45s, 4m 12s, 1h 23m.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [timespan] $Duration
+    )
+
+    if ($Duration.TotalSeconds -lt 1)  { return 'less than a second' }
+    if ($Duration.TotalMinutes -lt 1)  { return ('{0}s' -f [int] $Duration.TotalSeconds) }
+    if ($Duration.TotalHours -lt 1)    { return ('{0}m {1:00}s' -f [int] $Duration.TotalMinutes, $Duration.Seconds) }
+    return ('{0}h {1:00}m' -f [int] $Duration.TotalHours, $Duration.Minutes)
+}
+
 function Write-PubFileResult {
     <#
     .SYNOPSIS
@@ -290,6 +306,7 @@ Export-ModuleMember -Function @(
     'Get-PubLogFile'
     'Get-PubLogRoot'
     'Write-PubLog'
+    'Format-PubDuration'
     'Write-PubFileResult'
     'Write-PubPhaseSummary'
     'Get-PubRecentLogFile'

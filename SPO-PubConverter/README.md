@@ -382,6 +382,36 @@ Each phase ends with a summary — attempted / succeeded / failed / skipped, plu
 where the CSV and log were written. Menu option `11` tails the most recent log
 without leaving the console.
 
+## Watching a long crawl
+
+A tenant-wide scan runs for a long time, and most of that time is spent inside
+a single site paging through one large library. Progress is reported at three
+levels so it is always clear the run is alive:
+
+```
+Scanning SharePoint for .pub files
+  Site 15 of 45 | 312 .pub found | 6m 04s elapsed | about 12m 30s left
+  https://contoso.sharepoint.com/sites/Marketing
+    Library 2 of 6: Documents
+      184 folder(s) read | 41,900 item(s) seen | 12 .pub found | 37 folder(s) queued
+      /Campaigns/2024/Print (page 9)
+```
+
+* The **site bar** carries elapsed time, the running find count, and a rough
+  estimate of time remaining (from the third site onwards — sites vary enormously
+  in size, so treat it as an order of magnitude, not a promise).
+* The **library bar** updates on every page of every folder, so a library with
+  tens of thousands of items visibly ticks over rather than looking hung.
+* **Throttling** — the usual reason a crawl seems to stop dead — shows its own
+  countdown bar while it waits, instead of silence.
+* Any site that takes over a minute gets a line in the log saying how long it
+  took, so the slow ones can be identified after the run.
+
+**Partial results are saved as it goes.** Every 10 sites the inventory so far is
+written to `PublisherFileInventory_<timestamp>_partial.csv`, and the path is
+logged. If a long crawl is interrupted, load that file with menu option `6`
+rather than starting again.
+
 ## Error handling
 
 * Every Graph call goes through one wrapper with retry-and-backoff: HTTP 429
@@ -430,14 +460,14 @@ and `Upload.psm1` import it rather than defining the format again.
 .\tests\Run-Tests.ps1
 ```
 
-179 offline checks: every file parses and every module imports, the CSV schema
+189 offline checks: every file parses and every module imports, the CSV schema
 matches the brief exactly, local paths mirror SharePoint without collisions,
 filters and status counts behave, config round-trips without persisting
 secrets, certificate expiry warns at the right thresholds, the
 skip/overwrite/version rule does what it says, scope files load (including the
 SharePoint admin centre export unedited), the permission scopes stay separated
-and app role ids resolve live, a full discovery crawl runs against stubbed Graph
-responses (site resolution, library filtering, folder recursion, extension
+and app role ids resolve live, Graph paging hands each page to its progress callback,
+a full discovery crawl runs against stubbed Graph responses (site resolution, library filtering, folder recursion, extension
 matching, row construction), the menu renders correctly in every state
 (right options, right order, correct next step, nothing wider than 80
 columns), and the preserved parts of Tom's conversion script (the Interop enum, the COM pattern, `app.Quit()` in
